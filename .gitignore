@@ -1,0 +1,12 @@
+.venv/
+*.session
+*.session-journal
+*.session-wal
+*.session-shm
+spike/
+exports/
+.export-state.json
+.export.lock
+__pycache__/
+*.egg-info/
+.env
