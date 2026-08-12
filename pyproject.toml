@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-exporter"
+version = "0.1.0"
+description = "Export all media from a Telegram group to local disk, grouped by post, resumably."
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+# Telethon 2.0 is alpha with a renamed API surface. requirements.txt pins the
+# exact version the API probes were verified against.
+dependencies = ["telethon>=1.41,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+tg-export = "telegram_exporter.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/telegram_exporter"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

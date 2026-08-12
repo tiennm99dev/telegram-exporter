@@ -1,0 +1,6 @@
+# Pinned to the Telethon version the API probes were verified against.
+# Regenerate with `pip freeze` only after re-running spike/probe_telethon_api.py.
+pyaes==1.6.1
+pyasn1==0.6.4
+rsa==4.9.1
+Telethon==1.44.0
