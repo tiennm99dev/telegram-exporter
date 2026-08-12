@@ -211,8 +211,10 @@ async def _real_run(client, entity, *, root: Path, title: str, peer_id: int,
                 posts,
                 fetcher=Fetcher(client, entity, args.max_flood_wait),
                 state=state, sidecar=sidecar, root=root,
-                cfg=Config(min_free=min_free, disk_path=root,
-                           max_flood_wait=args.max_flood_wait),
+                # The flood ceiling reaches the network through the two
+                # primitives, not through Config: Fetcher above for the download
+                # path, iter_posts for the sweep.
+                cfg=Config(min_free=min_free, disk_path=root),
                 limit=args.limit)
     log.info("done: %s", totals.summary())
     return 0
@@ -234,6 +236,12 @@ def main() -> int:
         # disk cannot be trusted, and the cursor is where the last good post was.
         log.error("%s", e)
         return 1
+    except (ConnectionError, TimeoutError) as e:
+        # Before the OSError clause: both subclass it, and the sweep path has no
+        # retry of its own, so a mid-sweep reset arrives here. Calling that
+        # "filesystem" would send the operator to the wrong place entirely.
+        log.error("network: %s - the cursor is intact, re-run to resume", e)
+        return 1
     except OSError as e:
         # The download path maps these itself; this catches the same failures
         # arriving from the sidecar or state writes, so disk exhaustion exits 3
@@ -247,6 +255,13 @@ def main() -> int:
     except KeyboardInterrupt:
         log.info("interrupted - re-run the same command to resume")
         return 130
+    except Exception:
+        # Last resort, so no failure can exit outside the documented contract.
+        # The traceback is still printed - CPython does not put locals in it, so
+        # this cannot leak api_hash or a phone number - but the exit code stays
+        # meaningful and the operator is told the cursor is safe.
+        log.exception("unexpected error - the cursor is intact, re-run to resume")
+        return 1
 
 
 if __name__ == "__main__":
