@@ -126,6 +126,21 @@ def test_the_extension_is_sanitized_like_the_stem(name, expected):
     assert derive_filename(FakeMsg(7, kind="document", name=name)) == expected
 
 
+@pytest.mark.parametrize("raw,forbidden", [
+    ("a‮gpj.exe", "‮"),        # RIGHT-TO-LEFT OVERRIDE: renders a.exe.jpg
+    ("‮report.pdf", "‮"),
+    ("a​b.jpg", "​"),          # zero-width space
+    ("a b.jpg", " "),          # line separator: breaks `find` consumers
+    ("ab.jpg", ""),          # C1 NEL
+])
+def test_bidi_and_format_characters_cannot_spoof_an_extension(raw, forbidden):
+    """Stripping only C0 escapes closed the ANSI vector while leaving the older
+    extension-spoofing one open: <RLO> makes a .exe render as a .jpg in any
+    terminal or file manager."""
+    out = derive_filename(FakeMsg(12345, kind="document", name=raw))
+    assert forbidden not in out
+
+
 def test_no_control_character_survives_anywhere_in_a_filename():
     for raw in ["a\x00.b\x00c", "\x1b].jpg", "x.\ny", "n.\r\tz"]:
         out = derive_filename(FakeMsg(3, kind="document", name=raw))

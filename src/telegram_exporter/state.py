@@ -148,7 +148,16 @@ def _assert_compatible(existing: dict, *, chat_id: int, filters: Filters) -> Non
             f"chat mismatch: state file belongs to chat {existing.get('chat_id')}, "
             f"not {chat_id}\nexport each group to its own --out directory", 7)
 
-    was, now = existing.get("filters") or {}, filters.to_state()
+    if not isinstance(existing.get("filters"), dict):
+        # Absent or null is not the same condition as changed, and reporting it
+        # as a diff sends the user chasing a flag they never passed. Only a
+        # hand-edited or truncated state file gets here.
+        raise Abort(
+            f"state file has no filter set recorded, so the cursor's meaning is "
+            f"unknown - it means 'handled through here under these filters'.\n"
+            f"use --reset-state to start over", 7)
+
+    was, now = existing["filters"], filters.to_state()
     changed = [k for k in sorted(set(was) | set(now)) if was.get(k) != now.get(k)]
     if changed:
         lines = "\n".join(f"  {k+':':12} {_show(was.get(k))} -> {_show(now.get(k))}"

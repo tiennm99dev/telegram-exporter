@@ -113,7 +113,7 @@ but the end-to-end proof is phase 7 against a live group.
 - [x] Media that is deleted, expired, or unavailable is recorded and **skipped**, and the run continues
 - [x] `--verbose` leaves the `telethon` logger at `WARNING`; `api_hash` and phone absent from captured output
 - [x] Session file and every sibling are mode `0600`; export tree `0700`
-- [x] `pytest` green (180 tests); `pip install -r requirements.txt -e .` from a clean venv yields a working `tg-export`
+- [x] `pytest` green (204 tests, and green under `python -O`); `pip install -r requirements.txt -e .` from a clean venv yields a working `tg-export`
 
 ## Phases
 
@@ -153,6 +153,19 @@ but the end-to-end proof is phase 7 against a live group.
    plan claimed per-root locking made concurrent exports work; it does, but only
    with that second flag. Documented in the README and in the exit-3 message.
 
+11. **What consecutive-failure threshold should stop a run?** `completed_at` is
+   now withheld when every file failed, but a run against a dead session still
+   walks the entire history failing each message before returning. A circuit
+   breaker would stop it early; the threshold is a judgment call, because a dead
+   session and a legitimately corrupt region of history look identical from
+   inside `download_one`. **Not invented unilaterally.**
+12. **Should a server-declared 0-byte document be exportable?** The zero-byte
+   guard now refuses `actual == 0` for every kind, which is right for an empty
+   photo variant and for ENOSPC junk, but makes a genuinely empty uploaded
+   document unexportable — it costs three attempts and a FAILED record. If
+   Telegram permits such uploads, `declared == 0 and actual == 0` could be
+   accepted without weakening the guard. Needs a fact about Telegram that phase 1
+   could answer.
 ## Dependencies
 
 No cross-plan dependencies.
@@ -209,7 +222,7 @@ Evidence standard adapted for a greenfield repo: reviewers cited plan-file and r
 
 ### Session 1 — 2026-08-12/13 — phases 2–6
 
-Phases 2–6 implemented and green: **180 tests**, all offline against synthetic
+Phases 2–6 implemented and green: **204 tests**, all offline against synthetic
 message stubs. `pip install -r requirements.txt -e .` from a clean venv yields a
 working `tg-export` on Telethon **1.44.0** (aarch64 wheel).
 
@@ -298,6 +311,41 @@ differed — it now says a real run would refuse.
 
 Two criteria the review found untested are now tested: export-tree and file modes
 under the process umask, and control characters in the *extension*.
+
+### Red Team Review — Session 3 — 2026-08-13 (adversarial pass over the fixes)
+
+The session-2 fixes were unit-tested but never independently reviewed, so a
+second pass attacked them specifically. **It found that one of the fixes had
+broken the tool outright.**
+
+| # | Finding | Severity | Disposition |
+|---|---------|----------|-------------|
+| C1 | Removing `Config.max_flood_wait` left the call site in `cli._real_run` passing it — **every real export died with an uncaught `TypeError`** after taking both locks and writing `title.txt` and the state file, before downloading a byte | **Critical** | **Fixed.** Plus `tests/test_cli_dispatch.py`, which is the real remedy |
+| H-A | `AuthKeyNotFound` subclasses plain `Exception` and matched no clause. `MTProtoSender._disconnect` sets it on every in-flight request, so it is *more* likely than the `AuthKeyUnregisteredError` the taxonomy did list | High | **Fixed.** Added to `_AUTH_ERRORS` → exit 4 |
+| H-B | `CdnFileTamperedError` (a hash mismatch on CDN-served bytes) was swallowed by `SecurityError` in the network clause and reported as three lines of "network error" | High | **Fixed.** Own clause, own message, not retried |
+| H-C | Four of the six classes added for M3 are consumed inside Telethon's receive loop and can never reach an awaited request | Medium | **Fixed.** Dead arms removed; `InvalidBufferError` kept, since it does arrive for a transport-level 429 |
+| H-D | A dead session made `run_download` fail every file, return normally, and set `completed_at` over an empty tree | High | **Partly fixed.** `completed_at` is now withheld when everything failed and nothing succeeded. The circuit breaker is open question 11 |
+| M-A | `cli.main`'s `OSError` clause reported `ConnectionError`/`TimeoutError` as "filesystem" | Medium | **Fixed.** Network clause first; exit codes were already correct |
+| M-B | U+202E and other `Cf`/`Zl`/`Zp` characters survived sanitization — `a<RLO>gpj.exe` renders as `a.exe.jpg` | Medium | **Fixed.** Strips by Unicode category, which also subsumes the old C0 table |
+| M-C | A server-declared 0-byte document is now unexportable | Medium | **Open question 12** — a product call, not reversed unilaterally |
+| M-D | A state file with an absent `filters` key reported a phantom diff on `include_text` | Low | **Fixed.** Absent is now its own refusal |
+
+Also fixed: the retry ladder no longer sleeps after its final attempt (20 s per
+exhausted file, which on a dead connection was the difference between hours and
+days).
+
+**Why C1 escaped 180 passing tests, which is the more important finding.** Every
+test built `Config` by hand with the new signature, and not one exercised
+`cli.main()` or `_real_run`. The suite validated each unit and never the wiring
+between them, so a removed field and a stale call site could coexist happily.
+`tests/test_cli_dispatch.py` now drives `main()` end to end against a fake client
+— real run, resume, dry run, `--limit 0`, filter-mismatch exit 7, lock exit 3,
+and an unexpected exception still honoring the exit contract.
+
+Confirmed unchanged by this pass: Invariants 1–3, dry-run/real-run agreement for
+`limit ∈ {None, 0, 1, 2, 3, 5}`, and — importantly — that `sanitize_ext` is an
+identity transform for every ordinary extension, so no previously downloaded file
+is orphaned on resume.
 
 ## Validation Log
 

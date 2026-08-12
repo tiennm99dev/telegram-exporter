@@ -20,7 +20,11 @@ from telethon.errors import (
     MediaEmptyError,
     ServerError,
 )
-from telethon.errors.common import InvalidBufferError
+from telethon.errors.common import (
+    AuthKeyNotFound,
+    CdnFileTamperedError,
+    InvalidBufferError,
+)
 
 from telegram_exporter import downloader, paths
 from telegram_exporter.downloader import (
@@ -45,9 +49,12 @@ KIB = 1024
 
 @pytest.fixture(autouse=True)
 def no_real_backoff(monkeypatch):
-    """The retry ladder is 5/10/20 s in production; tests assert the ladder is
-    walked, not that it sleeps."""
+    """The retry ladder is 5/10 s in production; tests assert the ladder is
+    walked, not that it sleeps. Yields the real function for the one test that
+    is about the ladder's shape."""
+    real = downloader.backoff
     monkeypatch.setattr(downloader, "backoff", lambda attempt: 0)
+    return real
 
 
 class FakeFetcher:
@@ -313,8 +320,30 @@ def test_transport_level_errors_retry_rather_than_killing_the_run(tmp_path, exc)
     assert fetcher.calls == 2
 
 
+def test_a_cdn_integrity_failure_is_named_rather_than_called_a_network_error(
+        tmp_path, caplog):
+    """CdnFileTamperedError subclasses SecurityError and is raised on the
+    download path. Folding it into the network clause reported a trust-boundary
+    event as three lines of "network error" and a bland FAILED."""
+    _, target_dir = post_dir_for(tmp_path)
+    msg = FakeMsg(1042, kind="photo", size=len(PAYLOAD))
+    fetcher = FakeFetcher(raises=[CdnFileTamperedError()])
+
+    with caplog.at_level("ERROR"):
+        result = run(download_one(fetcher, target_dir, msg, cfg=cfg(tmp_path)))
+
+    assert result.status == FAILED
+    assert result.error == "cdn integrity check failed"
+    assert fetcher.calls == 1                      # not retried as if it were noise
+    assert "integrity check FAILED" in caplog.text
+
+
 @pytest.mark.parametrize("exc,code", [
     (AuthKeyUnregisteredError(request=None), 4),
+    # The one that actually arrives: MTProtoSender sets it on every in-flight
+    # request when the connection drops, and it subclasses plain Exception - so
+    # it used to escape every handler and end the run with a traceback.
+    (AuthKeyNotFound(), 4),
     (ChannelPrivateError(request=None), 5),
     (OSError(errno.ENOSPC, "No space left on device"), 3),
 ])
@@ -423,6 +452,52 @@ def test_limit_counts_posts_with_files(tmp_path):
 def test_completed_at_is_set_when_the_sweep_is_exhausted(tmp_path):
     root, _, _, _ = drive(tmp_path, [album(1042, [1042])])
     assert State.read(root)["completed_at"] is not None
+
+
+def test_a_run_where_everything_failed_is_never_marked_complete(tmp_path, caplog):
+    """A dead session looks exactly like this from inside the loop: ConnectionError
+    is retryable, so the sweep walks the whole history failing every file and
+    returns normally. Setting completed_at there would answer "did my export
+    finish?" with a confident yes over an empty tree."""
+    class AlwaysFails(FakeFetcher):
+        async def fetch(self, msg, fh):
+            self.calls += 1
+            raise ConnectionError("Cannot send requests while disconnected")
+
+    with caplog.at_level("ERROR"):
+        root, state, totals, _ = drive(
+            tmp_path, [album(1, [1]), album(2, [2])], fetcher=AlwaysFails())
+
+    assert totals.failed == 2 and totals.downloaded == 0
+    assert State.read(root)["completed_at"] is None
+    assert "not marking this export complete" in caplog.text
+    # The cursor still stands: those posts were handled, and the failures are
+    # recorded in the sidecar.
+    assert state.cursor_id == 2
+
+
+def test_a_partly_failed_run_is_still_complete(tmp_path):
+    class FailsOne(FakeFetcher):
+        async def fetch(self, msg, fh):
+            self.calls += 1
+            if msg.id == 2:
+                raise MediaEmptyError(request=None)
+            fh.write(self.payload)
+
+    root, _, totals, _ = drive(tmp_path, [album(1, [1]), album(2, [2])],
+                               fetcher=FailsOne())
+
+    assert totals.downloaded == 1 and totals.failed == 1
+    assert State.read(root)["completed_at"] is not None
+
+
+def test_the_retry_ladder_does_not_sleep_after_the_final_attempt(no_real_backoff):
+    # 20 s per exhausted file bought nothing; on a dead connection it was the
+    # difference between hours and days.
+    backoff = no_real_backoff
+    assert backoff(1) == 5.0
+    assert backoff(2) == 10.0
+    assert backoff(downloader.MAX_ATTEMPTS) == 0.0
 
 
 def test_the_whole_export_tree_is_private_under_the_process_umask(tmp_path):

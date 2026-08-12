@@ -68,26 +68,39 @@ DOWNLOADED, SKIPPED, FAILED = "DOWNLOADED", "SKIPPED", "FAILED"
 # a fresh violation and escalates the next wait.
 #
 # ServerError rather than only RpcCallFailError: the latter is one leaf of it, so
-# a plain Telegram -500 would otherwise escape. The telethon.errors.common set
-# derives from Exception and BufferError, not OSError - a corrupt packet or a
-# checksum failure on a flaky link is transient, but nothing below OSError would
-# have caught it, and an unhandled one ends a 20-hour unattended run with a
-# traceback.
+# a plain Telegram -500 would otherwise escape. BadMessageError arrives the same
+# way - MTProtoSender sets it on the pending request's future, so it surfaces at
+# the download await rather than in the receive loop.
+#
+# InvalidBufferError reaches an awaited request only for a transport-level 429,
+# where retrying beats ending the run. InvalidChecksumError and TypeNotFoundError
+# are deliberately absent: MTProtoSender consumes both inside its receive loop
+# and neither can surface here, so listing them would imply coverage this tuple
+# does not have. SecurityError is absent too - its one download-path member,
+# CdnFileTamperedError, gets its own clause below, and no other security failure
+# should be quietly retried.
 _NETWORK_ERRORS = (ConnectionError, TimeoutError, asyncio.TimeoutError,
                    asyncio.IncompleteReadError, ServerError,
                    telethon_common.InvalidBufferError,
-                   telethon_common.InvalidChecksumError,
-                   telethon_common.TypeNotFoundError,
-                   telethon_common.SecurityError,
                    telethon_common.BadMessageError)
+
+# AuthKeyNotFound is the one that actually arrives: MTProtoSender._disconnect
+# sets it on every in-flight request, and it subclasses plain Exception - so it
+# matched no clause here and ended the run with a traceback instead of the
+# documented exit 4. The RPC-level AuthKeyUnregisteredError is the rarer sibling.
 _AUTH_ERRORS = (AuthKeyUnregisteredError, AuthKeyDuplicatedError,
-                SessionRevokedError, UserDeactivatedBanError)
+                SessionRevokedError, UserDeactivatedBanError,
+                telethon_common.AuthKeyNotFound)
 _ACCESS_ERRORS = (ChannelPrivateError, ChatForbiddenError, ChannelInvalidError)
 _UNAVAILABLE_ERRORS = (MediaEmptyError, FileIdInvalidError, FilerefUpgradeNeededError)
 
 
 def backoff(attempt: int) -> float:
-    return 5.0 * 2 ** (attempt - 1)          # 5, 10, 20 s
+    """5, 10 - and 0 after the final attempt, because sleeping before giving up
+    buys nothing and costs 20 s per exhausted file."""
+    if attempt >= MAX_ATTEMPTS:
+        return 0.0
+    return 5.0 * 2 ** (attempt - 1)
 
 
 @dataclass(frozen=True)
@@ -309,6 +322,19 @@ async def download_one(fetcher, post_dir_path: Path, msg, *, cfg: Config) -> Res
             return _result(msg, FAILED,
                            error=f"media unavailable or expired: {type(e).__name__}")
 
+        # ---- INTEGRITY: not network trouble, and not retryable noise ------ #
+        except telethon_common.CdnFileTamperedError:
+            # The CDN served bytes whose hash does not match what Telegram
+            # signed. It subclasses SecurityError and is raised on the download
+            # path, so folding it into the network clause would report a
+            # trust-boundary event as three lines of "network error" and a bland
+            # FAILED. Recorded distinctly and skipped; the run continues, because
+            # one tampered file is not evidence about the rest.
+            tmp.unlink(missing_ok=True)
+            log.error("message %s: CDN integrity check FAILED - the served bytes "
+                      "do not match what Telegram signed; not retrying", msg.id)
+            return _result(msg, FAILED, error="cdn integrity check failed")
+
         # ---- ABORT: the run cannot continue ------------------------------- #
         except _AUTH_ERRORS:
             tmp.unlink(missing_ok=True)
@@ -419,7 +445,17 @@ async def run_download(posts, *, fetcher, state, sidecar, root: Path,
     # at the last post that happened to contain a file - and the next run would
     # re-sweep that whole tail to download nothing.
     state.commit(last_complete)
-    state.mark_completed()
+    if totals.failed and not (totals.downloaded or totals.skipped):
+        # Every single file failed and none succeeded. That is what a dead
+        # session looks like from in here - ConnectionError is retryable, so the
+        # loop walks the whole history failing everything and returns normally.
+        # Setting completed_at on that would answer "did my export finish?" with
+        # a confident yes over an empty tree. The cursor still stands: the posts
+        # were handled, and their failures are in the sidecar.
+        log.error("every file failed (%d) and none succeeded - not marking this "
+                  "export complete; check connectivity and re-run", totals.failed)
+    else:
+        state.mark_completed()
     return totals
 
 

@@ -93,6 +93,23 @@ def test_limit_is_not_part_of_the_stored_filter_set(tmp_path):
     assert "limit" not in open_state(tmp_path).data["filters"]
 
 
+@pytest.mark.parametrize("filters_value", ["MISSING", None, "not-a-dict"])
+def test_a_state_file_with_no_filter_set_is_refused_as_its_own_condition(
+        tmp_path, filters_value):
+    data = {"version": 1, "chat_id": CHAT, "cursor_id": 99, "filters": filters_value}
+    if filters_value == "MISSING":
+        del data["filters"]
+    (tmp_path / STATE_NAME).write_text(json.dumps(data))
+
+    with pytest.raises(Abort) as excinfo:
+        open_state(tmp_path)
+
+    assert excinfo.value.code == 7
+    assert "no filter set recorded" in excinfo.value.reason
+    # Not reported as a phantom diff on a flag the user never passed.
+    assert "include_text:" not in excinfo.value.reason
+
+
 def test_a_corrupt_state_file_is_refused_rather_than_ignored(tmp_path):
     (tmp_path / STATE_NAME).write_text("{not json")
     with pytest.raises(Abort) as excinfo:

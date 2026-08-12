@@ -22,15 +22,28 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 from .media import file_ext, file_stem, media_kind
 
-# Control characters are removed outright rather than replaced: a NUL truncates
-# the filename at the syscall boundary, so leaving a placeholder would only hide
-# what happened.
-_CONTROL = {c: None for c in range(0x20)}
-_CONTROL[0x7F] = None
+# Characters removed outright rather than replaced: a NUL truncates the filename
+# at the syscall boundary, so leaving a placeholder would only hide what
+# happened.
+#
+#   Cc  C0 and C1 controls, including NUL and the ESC that starts an ANSI escape
+#   Cf  format characters - U+202E RIGHT-TO-LEFT OVERRIDE is the one that
+#       matters: `a<RLO>gpj.exe` renders as `a.exe.jpg` in any terminal or file
+#       manager, so stripping only C0 would close the ANSI vector while leaving
+#       the older extension-spoofing one wide open
+#   Zl/Zp  line and paragraph separators, which break line-oriented consumers of
+#       a file listing
+#   Cs  lone surrogates, which cannot be encoded to UTF-8 at all
+_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
+
+def _is_disallowed(ch: str) -> bool:
+    return unicodedata.category(ch) in _STRIPPED_CATEGORIES
 
 # Path separators and shell/Windows reserved characters become underscores.
 _RESERVED = str.maketrans({ch: "_" for ch in '/\\:*?"<>|'})
@@ -113,7 +126,7 @@ def sanitize(name: str, *, fallback: str, max_bytes: int = MAX_NAME_BYTES) -> st
     so `../../../etc/passwd` loses its directories rather than becoming
     `.._.._.._etc_passwd`.
     """
-    s = str(name).translate(_CONTROL)
+    s = "".join(ch for ch in str(name) if not _is_disallowed(ch))
     s = _leaf(s)                              # discards every directory part, incl. ..
     s = s.translate(_RESERVED)
     s = _WHITESPACE_RUN.sub(" ", s).strip()
