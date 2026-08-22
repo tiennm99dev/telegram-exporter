@@ -230,8 +230,9 @@ unbounded error.
 
 `--dry-run` reads the cursor and measures from where a real run would start, so
 `tg-export --dry-run && tg-export` works on a partially completed export. It takes
-no lock, creates no directories, and mutates nothing — you can run it while a real
-export is in progress.
+no export lock, creates no directories, and mutates nothing. It does open the
+session file, so running it alongside an export in progress needs its own
+`--session` — see [Concurrent runs](#concurrent-runs).
 
 ## Concurrent runs
 
@@ -244,16 +245,21 @@ Exporting two *different* groups at the same time works, but each needs its own
 is locked too, because two Telethon clients sharing one session is a corruption
 hazard Telethon itself warns about.
 
-`--dry-run` takes no lock at all, so it can always be run against an export that
-is currently in progress.
+`--dry-run` takes no *export* lock, so it never contends for an export root. It
+does open the session file and therefore takes the session lock: to run it
+alongside an export in progress, give it its own `--session`.
+
+Both locks are `flock`-based. On NFS and some network filesystems `flock` is
+advisory-only or silently per-client, so single-instance enforcement is not
+guaranteed there — keep the session file and the export root on local storage.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | unexpected error, or a bad argument |
-| 2 | `--dry-run` says it will not fit |
+| 1 | unexpected error |
+| 2 | `--dry-run` says it will not fit, **or** a bad/missing argument — argparse exits 2 too |
 | 3 | disk exhausted, or another run holds the lock |
 | 4 | session invalidated — re-login |
 | 5 | lost access to the group |
@@ -264,8 +270,9 @@ is currently in progress.
 ## Development
 
 ```bash
+python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt -e ".[dev]"
-.venv/bin/pytest
+.venv/bin/python -m pytest              # 214 tests, ~3 s
 ```
 
 The whole suite runs offline against synthetic message stubs — no credentials, no

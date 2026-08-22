@@ -56,6 +56,14 @@ Every step below has a checkable outcome. **No step may pass by escape clause.**
 
 12. **Memory** — `/usr/bin/time -v tg-export --dry-run` → peak RSS under 200 MB. The album tripwire set is O(albums), not O(1); the criterion states the real bound.
 
+12b. **Sweep cost under a date filter** — measure before deciding whether to optimize it. With `reverse=True` and no `offset_date`, telethon 1.44's `_MessagesIter._init` starts the sweep at message id 1, so `--since` walks the entire history discarding messages in `keep()`. Time `--dry-run --since <recent date>` against a large group and record the wall clock, the getHistory round-trip count, and the ratio of messages swept to messages kept. Do the same for `--until`, which currently never terminates the sweep early.
+
+  Both fixes carry an invariant risk, which is why this is a measurement rather than a change:
+  - server-side `offset_date` can start the sweep *mid-album*, so `_close` would take a `post_id` that is not the album's lowest id — breaking filter-invariant post identity. Needs a mid-album guard before it is safe.
+  - an early break on `--until` assumes message dates rise monotonically with ids, which is false for imported history.
+
+  Decide with the numbers: if the ratio is small the current sweep is fine, and neither risk is worth taking.
+
 13. **Revoke the spike session** — Telegram → Settings → Devices → terminate the phase 1 probe session. **Deleting `spike/probe.session` does not revoke server-side authorization**; a live auth key otherwise survives for an account you believe is clean.
 
 ## Related Code Files
