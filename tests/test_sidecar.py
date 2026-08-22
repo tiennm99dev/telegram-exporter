@@ -119,3 +119,35 @@ def test_sender_name_is_only_taken_from_an_already_cached_sender(tmp_path):
     assert records[0]["sender_name"] == "Alice"
     assert records[1]["sender_name"] is None
     assert records[1]["sender_id"] == 778
+
+
+def test_a_partial_record_larger_than_the_scan_window_keeps_earlier_records(tmp_path):
+    # Scanning back a fixed window for the last newline finds none when the
+    # partial record is bigger than the window. Truncating to `end - window`
+    # then cuts inside the partial record and leaves the file just as unreadable,
+    # one window shorter - so the window has to grow until a newline is found.
+    path = tmp_path / SIDECAR_NAME
+    good = '{"message_id": 1}'
+    partial = '{"message_id": 2, "caption": "' + "x" * (2 << 20)
+    path.write_text(good + "\n" + partial)
+
+    with Sidecar(tmp_path):
+        pass
+
+    assert lines(tmp_path) == [good]
+
+
+def test_two_rotations_in_the_same_second_both_stay_inspectable(tmp_path):
+    # os.replace onto a one-second stamp silently overwrote the first archive,
+    # which is the whole reason --reset-state rotates instead of deleting.
+    path = tmp_path / SIDECAR_NAME
+    path.write_text('{"message_id": 1}\n')
+    first = Sidecar(tmp_path).rotate()
+    path.write_text('{"message_id": 2}\n')
+    second = Sidecar(tmp_path).rotate()
+
+    assert first is not None and second is not None
+    assert first != second
+    assert first.exists() and second.exists()
+    assert json.loads(first.read_text())["message_id"] == 1
+    assert json.loads(second.read_text())["message_id"] == 2

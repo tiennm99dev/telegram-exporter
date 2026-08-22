@@ -205,3 +205,35 @@ def test_a_second_concurrent_run_exits_three(wired, monkeypatch, tmp_path):
     with cli.exclusive(root / cli.LOCK_NAME):
         code = run_cli(monkeypatch, "--group", "@mygroup", "--out", str(out))
     assert code == 3
+
+
+def test_a_session_lock_conflict_is_refused_before_the_session_is_opened(
+        wired, monkeypatch, tmp_path):
+    # The session lock was taken after connect() and _login() had already written
+    # the shared SQLite session, so the loser reported the conflict having caused
+    # it. The session file must not exist at all when the lock is contended.
+    session = tmp_path / "state" / "tg-export" / "default.session"
+    session.parent.mkdir(parents=True, exist_ok=True)
+
+    with cli.exclusive(session.with_name(session.name + ".lock")):
+        code = run_cli(monkeypatch, "--group", "@mygroup",
+                       "--out", str(tmp_path / "exports"))
+
+    assert code == 3
+    assert not session.exists()
+    assert wired.downloads == []
+
+
+def test_dry_run_contends_for_the_session_lock_too(wired, monkeypatch, tmp_path):
+    # --dry-run writes nothing to the export tree, but it opens the same session
+    # file - which is the resource this lock is about - so it needs its own
+    # --session to run alongside a real export.
+    session = tmp_path / "state" / "tg-export" / "default.session"
+    session.parent.mkdir(parents=True, exist_ok=True)
+
+    with cli.exclusive(session.with_name(session.name + ".lock")):
+        code = run_cli(monkeypatch, "--group", "@mygroup", "--dry-run",
+                       "--out", str(tmp_path / "exports"))
+
+    assert code == 3
+    assert not session.exists()

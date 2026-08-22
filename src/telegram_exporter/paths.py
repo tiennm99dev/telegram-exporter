@@ -56,6 +56,20 @@ MAX_NAME_BYTES = 200
 MAX_EXT_BYTES = 16
 
 
+def strip_unprintable(text: str) -> str:
+    """Strip the categories that make a string unsafe to *print*, leaving it
+    otherwise intact.
+
+    sanitize() below reduces an untrusted string to a single path component.
+    This does the much smaller job that untrusted text written as *data* needs -
+    title.txt - where spaces, punctuation and slashes are all legitimate content,
+    but an ANSI escape or a U+202E override still reaches the operator's terminal
+    the moment they `cat` the file. Same category set, so the two rules cannot
+    drift apart.
+    """
+    return "".join(ch for ch in str(text) if not _is_disallowed(ch))
+
+
 def export_root(out_dir: Path, peer_id: int) -> Path:
     """`<out>/g<chat_id>` - the directory name is the chat id, never the title.
 

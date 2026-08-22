@@ -14,6 +14,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .state import fsync_dir
+
 log = logging.getLogger("telegram_exporter.sidecar")
 
 SIDECAR_NAME = "messages.jsonl"
@@ -58,10 +60,18 @@ class Sidecar:
         with open(self.path, "rb+") as f:
             f.seek(0, os.SEEK_END)
             end = f.tell()
+            # Grow the window until a newline is actually found. A record longer
+            # than the window contains no newline at all, and truncating to
+            # `end - window` would then cut in the middle of an earlier, valid
+            # record - leaving the file just as unreadable, one megabyte shorter.
             window = min(end, 1 << 20)
-            f.seek(end - window)
-            tail = f.read(window)
-            cut = tail.rfind(b"\n")
+            while True:
+                f.seek(end - window)
+                tail = f.read(window)
+                cut = tail.rfind(b"\n")
+                if cut != -1 or window == end:
+                    break
+                window = min(end, window * 2)
             trailing = tail[cut + 1:]
             if not trailing:
                 return                      # file ends on a newline: intact
@@ -83,7 +93,15 @@ class Sidecar:
             return None
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         target = self.root / f"messages-{stamp}.jsonl"
+        # Two resets inside the same second must not clobber the first archive:
+        # rotating instead of deleting is only worth doing if the old log stays
+        # inspectable, and os.replace would have overwritten it silently.
+        serial = 1
+        while target.exists():
+            target = self.root / f"messages-{stamp}-{serial}.jsonl"
+            serial += 1
         os.replace(self.path, target)
+        fsync_dir(self.root)        # a rename is not durable until its dir entry is
         log.info("rotated %s -> %s", self.path.name, target.name)
         return target
 

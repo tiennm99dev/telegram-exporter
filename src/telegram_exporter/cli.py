@@ -154,22 +154,35 @@ async def _run(args) -> int:
     session_path = with_session_suffix(
         Path(args.session).expanduser() if args.session else default_session_path())
 
-    async with connected_client(session_path, api_id, api_hash) as client:
-        entity, peer_id = await resolve_entity(client, args.group)
-        title = (getattr(entity, "title", None)
-                 or getattr(entity, "username", None) or str(peer_id))
-        root = paths.export_root(Path(args.out).expanduser(), peer_id)
-        assert_not_committable(root, is_dir=True)
-        log.info("group %r (id %s) -> %s", title, peer_id, root)
+    # The session lock guards the SQLite session file, so it has to be held
+    # before anything opens that file - connect() and _login() both write to it.
+    # Taken deeper in, it locked *after* the damage: two runs sharing the default
+    # session each passed their own per-root lock, both opened the same database,
+    # and the loser reported the conflict having already caused it.
+    #
+    # --dry-run is inside the lock too. It writes nothing to the export tree, but
+    # it opens the same session file, which is the resource this lock is about -
+    # so a dry-run alongside a real export needs its own --session.
+    #
+    # Refuse a committable path before the lock, so a rejected run leaves no
+    # lock file behind next to a session it was never allowed to create.
+    assert_not_committable(session_path)
+    with exclusive(session_path.with_name(session_path.name + ".lock")):
+        async with connected_client(session_path, api_id, api_hash) as client:
+            entity, peer_id = await resolve_entity(client, args.group)
+            title = (getattr(entity, "title", None)
+                     or getattr(entity, "username", None) or str(peer_id))
+            root = paths.export_root(Path(args.out).expanduser(), peer_id)
+            assert_not_committable(root, is_dir=True)
+            log.info("group %r (id %s) -> %s", title, peer_id, root)
 
-        if args.dry_run:
-            return await _dry_run(client, entity, root=root, title=title,
-                                  peer_id=peer_id, filters=filters,
-                                  min_free=min_free, args=args)
-        return await _real_run(client, entity, root=root, title=title,
-                               peer_id=peer_id, filters=filters,
-                               min_free=min_free, session_path=session_path,
-                               args=args)
+            if args.dry_run:
+                return await _dry_run(client, entity, root=root, title=title,
+                                      peer_id=peer_id, filters=filters,
+                                      min_free=min_free, args=args)
+            return await _real_run(client, entity, root=root, title=title,
+                                   peer_id=peer_id, filters=filters,
+                                   min_free=min_free, args=args)
 
 
 async def _dry_run(client, entity, *, root: Path, title: str, peer_id: int,
@@ -185,24 +198,30 @@ async def _dry_run(client, entity, *, root: Path, title: str, peer_id: int,
 
 
 async def _real_run(client, entity, *, root: Path, title: str, peer_id: int,
-                    filters, min_free: int, session_path: Path, args) -> int:
+                    filters, min_free: int, args) -> int:
     root.mkdir(parents=True, exist_ok=True)
-    session_lock = session_path.with_name(session_path.name + ".lock")
 
-    # Both locks before the .part sweep: the sweep is the destructive operation,
-    # so locking after it would lock after the damage. Per-root rather than
-    # global, because exporting two different groups concurrently is legitimate.
-    with exclusive(root / LOCK_NAME), exclusive(session_lock):
+    # The export lock before the .part sweep: the sweep is the destructive
+    # operation, so locking after it would lock after the damage. Per-root rather
+    # than global, because exporting two different groups concurrently is
+    # legitimate - each with its own --session, which the session lock in _run
+    # now enforces rather than merely documents.
+    with exclusive(root / LOCK_NAME):
         sweep_part_files(root)
         write_title(root, title)
 
-        # State first: it refuses a filter or chat mismatch (exit 7) before the
-        # sidecar is touched.
-        state = State.open(root, chat_id=peer_id, chat_title=title,
-                           filters=filters, reset=args.reset_state)
+        # Rotate before the cursor is zeroed, and only under --reset-state -
+        # which is the one path with no compatibility check to fail, since the
+        # stored filters are being discarded. Opening state first made the zeroed
+        # cursor durable while the previous regime's sidecar was still in place,
+        # which is exactly the mixed-generation log that rotating exists to
+        # prevent. Without --reset-state nothing here is touched, so State.open
+        # still refuses a filter or chat mismatch (exit 7) before any write.
         sidecar = Sidecar(root)
         if args.reset_state:
             sidecar.rotate()
+        state = State.open(root, chat_id=peer_id, chat_title=title,
+                           filters=filters, reset=args.reset_state)
 
         with sidecar:
             posts = iter_posts(client, entity, after_id=state.cursor_id,

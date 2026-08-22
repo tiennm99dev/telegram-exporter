@@ -280,9 +280,16 @@ async def download_one(fetcher, post_dir_path: Path, msg, *, cfg: Config) -> Res
         log.error("cannot build a safe path for message %s: %s - skipping", msg.id, e)
         return _result(msg, FAILED, error=f"unsafe filename: {e}")
 
-    if target.exists():
-        if target.stat().st_size > 0:
-            return _result(msg, SKIPPED, target)
+    # One stat, not three. An already-present file is the common case on every
+    # resume, and reusing this size as the recorded size keeps the whole skip
+    # path to a single syscall.
+    try:
+        present = target.stat().st_size
+    except FileNotFoundError:
+        present = None
+    if present is not None:
+        if present > 0:
+            return _result(msg, SKIPPED, target, size=present)
         # Zero bytes means ENOSPC junk, never a complete download - re-fetch.
         target.unlink()
 
@@ -291,7 +298,9 @@ async def download_one(fetcher, post_dir_path: Path, msg, *, cfg: Config) -> Res
     tmp = target.with_name(target.name + PART_SUFFIX)
     refreshed = False
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    attempt = 0
+    while attempt < MAX_ATTEMPTS:
+        attempt += 1
         try:
             with open(tmp, "wb") as fh:
                 await fetcher.fetch(msg, fh)
@@ -315,6 +324,12 @@ async def download_one(fetcher, post_dir_path: Path, msg, *, cfg: Config) -> Res
             refreshed = True
             if fresh is None or not has_media(fresh):
                 return _result(msg, FAILED, error="message deleted")
+            # Renewing a reference is not a failed attempt. Counting it burned
+            # the last slot when expiry landed on the final attempt, so the
+            # fresh reference was never actually fetched and the message was
+            # reported as "exhausted N attempts" having been tried N-1 times.
+            # The `refreshed` latch above bounds this arm, so it cannot loop.
+            attempt -= 1
             msg = fresh
             continue
         except _UNAVAILABLE_ERRORS as e:
@@ -369,13 +384,15 @@ async def download_one(fetcher, post_dir_path: Path, msg, *, cfg: Config) -> Res
 
 
 def _result(msg, status: str, target: Path | None = None,
-            error: str | None = None) -> Result:
+            error: str | None = None, size: int | None = None) -> Result:
     f = getattr(msg, "file", None)
+    if size is None and target is not None:
+        size = target.stat().st_size
     return Result(
         message_id=msg.id,
         status=status,
         path=target,
-        size=target.stat().st_size if target is not None else None,
+        size=size,
         declared_size=media_size(msg),
         name=getattr(f, "name", None) or f"{media_kind(msg)}{file_ext(msg)}",
         mime=getattr(f, "mime_type", None),
@@ -416,7 +433,11 @@ async def run_download(posts, *, fetcher, state, sidecar, root: Path,
                 result = await download_one(fetcher, target_dir, msg, cfg=cfg)
                 results.append(result)
                 _tally(totals, result, post.post_id)
-            if target_dir.exists():
+            # Only a rename needs its directory entry forced. When every file in
+            # the post was already present nothing was renamed, so a resume
+            # across a mostly-complete export no longer pays one fsync per post
+            # to make a directory entry durable that a previous run already did.
+            if any(r.status == DOWNLOADED for r in results) and target_dir.exists():
                 fsync_dir(target_dir)
 
         # A post may be empty (everything filtered out) or text-only under
@@ -445,15 +466,25 @@ async def run_download(posts, *, fetcher, state, sidecar, root: Path,
     # at the last post that happened to contain a file - and the next run would
     # re-sweep that whole tail to download nothing.
     state.commit(last_complete)
-    if totals.failed and not (totals.downloaded or totals.skipped):
-        # Every single file failed and none succeeded. That is what a dead
-        # session looks like from in here - ConnectionError is retryable, so the
-        # loop walks the whole history failing everything and returns normally.
+    if totals.failed > totals.downloaded + totals.skipped:
+        # Failures outnumber everything that worked. That is what a dead media DC
+        # looks like from in here - ConnectionError is retryable, so the loop
+        # walks the whole history failing everything and returns normally.
         # Setting completed_at on that would answer "did my export finish?" with
-        # a confident yes over an empty tree. The cursor still stands: the posts
-        # were handled, and their failures are in the sidecar.
-        log.error("every file failed (%d) and none succeeded - not marking this "
-                  "export complete; check connectivity and re-run", totals.failed)
+        # a confident yes over a mostly-empty tree.
+        #
+        # Compared against downloaded + skipped, not against zero: requiring
+        # *nothing* to have succeeded meant a single already-present file
+        # disabled the guard entirely, so any resume over a partly-complete
+        # export could fail every remaining file and still be marked finished.
+        # A legitimate tail of already-present files still outnumbers its own
+        # stray failures, so it completes normally.
+        #
+        # The cursor still stands either way: the posts were handled, and their
+        # failures are in the sidecar.
+        log.error("%d files failed, outnumbering the %d downloaded and %d already "
+                  "present - not marking this export complete; check connectivity "
+                  "and re-run", totals.failed, totals.downloaded, totals.skipped)
     else:
         state.mark_completed()
     return totals
@@ -474,6 +505,23 @@ def _tally(totals: Totals, result: Result, post_id: int) -> None:
 
 def write_title(root: Path, title: str) -> None:
     """The human-readable group name lives here, as data - never as a path
-    component. Written once; a later rename updates it without moving anything."""
+    component. Written once; a later rename updates it without moving anything.
+
+    Server-supplied and editable by any admin, so it is stripped of the
+    unprintable categories before landing on disk: the export root is protected
+    by never putting the title in a path at all, but `cat title.txt` would
+    otherwise feed ANSI escapes or a right-to-left override to the operator's
+    terminal.
+
+    Atomic like every other write here. A torn title.txt is only cosmetic, but it
+    was the one file in the tree that could be observed half-written.
+    """
     root.mkdir(parents=True, exist_ok=True)
-    (root / TITLE_NAME).write_text((title or "") + "\n", encoding="utf-8")
+    target = root / TITLE_NAME
+    tmp = target.with_name(target.name + PART_SUFFIX)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(paths.strip_unprintable(title or "") + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+    fsync_dir(root)

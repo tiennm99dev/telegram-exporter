@@ -35,6 +35,7 @@ from telegram_exporter.downloader import (
     download_one,
     run_download,
     sweep_part_files,
+    TITLE_NAME,
     write_title,
 )
 from telegram_exporter.session import Abort
@@ -525,3 +526,99 @@ def test_limit_zero_connects_and_does_nothing(tmp_path):
     assert totals.posts == 0
     assert state.cursor_id == 0
     assert not (root / "1042").exists()
+
+
+def test_a_reference_renewed_on_the_final_attempt_is_actually_fetched(tmp_path):
+    # Renewing a file reference is not a failed attempt. Counting it consumed
+    # the last slot, so expiry landing on the final attempt reported "exhausted
+    # 3 attempts" for a message that was only ever tried twice - and the docstring
+    # on that arm says a 20-hour run *will* reach it.
+    root, target_dir = post_dir_for(tmp_path)
+    msg = FakeMsg(1042, kind="photo", size=len(PAYLOAD))
+    fetcher = FakeFetcher(raises=[ConnectionResetError(), ConnectionResetError(),
+                                  FileReferenceExpiredError(request=None)])
+
+    result = run(download_one(fetcher, target_dir, msg, cfg=cfg(tmp_path)))
+
+    assert result.status == DOWNLOADED
+    assert fetcher.refresh_calls == 1
+    assert (target_dir / "1042_photo.jpg").read_bytes() == PAYLOAD
+
+
+def test_an_already_present_file_reports_its_size_without_restatting(tmp_path):
+    root, target_dir = post_dir_for(tmp_path)
+    (target_dir / "1042_photo.jpg").write_bytes(b"abcdef")
+    msg = FakeMsg(1042, kind="photo", size=len(PAYLOAD))
+    fetcher = FakeFetcher()
+
+    result = run(download_one(fetcher, target_dir, msg, cfg=cfg(tmp_path)))
+
+    assert result.status == SKIPPED
+    assert result.size == 6
+    assert fetcher.calls == 0
+
+
+def test_a_post_whose_files_are_all_present_does_not_fsync_its_directory(
+        tmp_path, monkeypatch):
+    # The post directory is fsynced to make a rename durable. When every file was
+    # already on disk nothing was renamed, so a resume across a mostly-complete
+    # export should not pay one fsync per post for a directory entry an earlier
+    # run already made durable.
+    calls = []
+    monkeypatch.setattr(downloader, "fsync_dir", lambda p: calls.append(p))
+    root = paths.export_root(tmp_path, -1001)
+    for message_id in (1042, 1043):
+        path = paths.post_dir(root, 1042) / f"{message_id}_photo.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(PAYLOAD)
+
+    _, _, totals, _ = drive(tmp_path, [album(1042, [1042, 1043])])
+
+    assert totals.skipped == 2 and totals.downloaded == 0
+    assert calls == []
+
+
+def test_a_post_with_one_new_file_still_fsyncs_its_directory(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(downloader, "fsync_dir", lambda p: calls.append(p))
+
+    _, _, totals, _ = drive(tmp_path, [album(1042, [1042, 1043])])
+
+    assert totals.downloaded == 2
+    assert calls == [paths.post_dir(paths.export_root(tmp_path, -1001), 1042)]
+
+
+def test_a_resume_where_failures_outnumber_successes_is_not_marked_complete(tmp_path):
+    # One already-present file used to disable this guard outright: it required
+    # that *nothing* had succeeded, so any resume across a partly-complete export
+    # could fail every remaining file and still record the export as finished.
+    class MediaDcIsDead(FakeFetcher):
+        async def fetch(self, msg, fh):
+            self.calls += 1
+            raise ConnectionError("Cannot send requests while disconnected")
+
+    root = paths.export_root(tmp_path, -1001)
+    present = paths.post_dir(root, 1) / "1_photo.jpg"
+    present.parent.mkdir(parents=True, exist_ok=True)
+    present.write_bytes(PAYLOAD)
+
+    root, state, totals, _ = drive(
+        tmp_path, [album(1, [1]), album(2, [2]), album(3, [3])],
+        fetcher=MediaDcIsDead())
+
+    assert totals.skipped == 1 and totals.failed == 2 and totals.downloaded == 0
+    assert State.read(root)["completed_at"] is None
+    assert state.cursor_id == 3              # the cursor still stands
+
+
+def test_the_group_title_is_written_without_terminal_escapes(tmp_path):
+    # Server-supplied and admin-editable. The export root is safe because the
+    # title never becomes a path component, but `cat title.txt` would still have
+    # handed ANSI escapes and a right-to-left override to the operator.
+    root = paths.export_root(tmp_path, -1001)
+    write_title(root, "My \x1b[31mGroup\x1b[0m ‮gpj.exe")
+
+    text = (root / "title.txt").read_text()
+    assert "\x1b" not in text and "‮" not in text
+    assert "Group" in text and "gpj.exe" in text
+    assert not (root / (TITLE_NAME + ".part")).exists()    # atomic, nothing left over

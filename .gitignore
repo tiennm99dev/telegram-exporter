@@ -10,3 +10,6 @@ exports/
 __pycache__/
 *.egg-info/
 .env
+.coverage
+.pytest_cache/
+.claude/agent-memory/
