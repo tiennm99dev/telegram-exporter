@@ -1,281 +1,124 @@
-# telegram-exporter
+# telegram-exporter — ⚠️ churned
 
-`tg-export` downloads **all media from a Telegram group** to local disk, one
-folder per logical post (albums collapsed), with a `messages.jsonl` sidecar that
-links every file back to its message. Resumable, filterable, with a dry-run size
-estimate.
+**Status: churned as of 2026-08-25. No further development, no maintenance, no
+issue support.** This repo now contains only these instructions; the retired
+Python implementation lives in git history (see the last section).
 
-```bash
-export TG_API_ID=... TG_API_HASH=...
+## Why
 
-tg-export --group @mygroup --out ./exports --dry-run   # what would it fetch?
-tg-export --group @mygroup --out ./exports             # fetch it
-```
+[iyear/tdl](https://github.com/iyear/tdl) — an actively maintained Telegram
+toolkit in Go, built on [gotd/td](https://github.com/gotd/td) — already covers
+this project's purpose: export chat history and download media from DMs, groups
+and channels over MTProto with a user account (so neither Bot API limit applies:
+it can read history, and there is no 20 MB download cap). Maintaining a parallel
+tool is not justified.
 
-Kill it at any point and re-run the same command; it resumes without
-re-downloading and without gaps.
+In short: a gotd-based rewrite was researched and judged feasible but not
+worth it, since tdl already exists and is proven; the original project's
+research and build reports are in git history at commit `3286ee2`.
 
-## Why the Bot API cannot do this
+## Use tdl instead
 
-This is the first question most people ask, so: a bot cannot read a group's
-message history at all, and the Bot API caps file downloads at 20 MB. Both limits
-are structural, not configuration. Exporting history therefore requires MTProto
-with a **user account**, which is what Telethon provides.
-
-## Install
-
-Python 3.12+.
+Install: see <https://docs.iyear.me/tdl/getting-started/installation/>.
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt -e .
-.venv/bin/tg-export --help
+tdl login                                   # user-account login (phone + code + 2FA)
+
+# 1) export message metadata to JSON
+tdl chat export -c @mygroup --all --with-content -o export.json
+
+# 2) download the media it references
+tdl dl -f export.json -d ./exports --takeout --group --skip-same --continue
 ```
 
-`requirements.txt` pins the exact Telethon version the API probes were verified
-against. Telethon 2.0 is alpha with a renamed API surface, hence the `<2` bound.
+Flag notes, mapped to what this project used to do:
 
-`cryptg` is **optional and not installed**. It is a native extension sitting in
-Telethon's AES path, so it sees the auth key and every plaintext byte. It ships an
-aarch64 wheel (no build step), and the reason to trust it *if* you adopt it is
-that the Telethon author maintains it — not that it is "CPU-side only". Do not add
-a supply-chain root for a throughput problem you have not measured.
+- `--takeout` — takeout session with lower flood-wait limits for bulk export
+  (an improvement this project never had).
+- `--group` — detect albums (`grouped_id`) and download grouped messages together.
+- `--skip-same` + `--continue` — resume: skip files matching existing name+size,
+  continue interrupted downloads without prompting.
+- `--all --with-content` — include text-only messages with their content
+  (equivalent of `--include-text`).
+- Filters: time range / message-id range via `-i`, plus expression filters, e.g.
+  `-f "Media.Size > 5*1024*1024"`. Extension filters via `-i jpg,png` / `-e mp4`.
+- tdl defaults to aggressive parallelism (`-t 8 -l 4`). If you hit flood waits
+  on a large export, lower it (`-t 4 -l 1`).
 
-## Credentials
+What tdl does **not** replicate from this project's contract: per-post album
+folders keyed on message id, the `messages.jsonl` append-only sidecar, the
+cursor with filter-mismatch refusal, and the dry-run disk estimate. If you need
+those guarantees, the old implementation is in this repo's history and `src/`.
 
-Create an app at <https://my.telegram.org> → API development tools.
+## Special case: exporting to WebDAV
 
-| Credential | Source | Why |
-|---|---|---|
-| `api_id`, `api_hash` | env `TG_API_ID` / `TG_API_HASH` only | needed every run; revocable |
-| phone | prompt; `TG_PHONE` optional | PII, not a secret |
-| login code | **prompt only** | single-use, 5-minute TTL |
-| 2FA password | **`getpass` only** — no env, no file, no flag | once per session lifetime |
+tdl can only write to a local directory — it has no WebDAV (or any remote)
+destination. When the group's media is larger than local disk, use a **rolling
+pipeline**: tdl downloads into a small staging directory while
+[rclone](https://rclone.org/) concurrently moves (upload + delete local)
+finished files to WebDAV. Local disk then only needs to hold the files
+currently in flight plus one sync interval of throughput — Telegram caps a
+single file at 2 GB (4 GB from premium uploaders), so a few dozen GB of staging
+covers the worst case regardless of the group's total size.
 
-`.env` **may** contain `TG_API_ID`, `TG_API_HASH`, `TG_PHONE`. It **must not**
-contain the 2FA password, a login code, or session data. The app does not read
-`.env` — your shell already does that:
+One-time rclone remote setup:
 
 ```bash
-set -a; . ./.env; set +a
+rclone config create tg-webdav webdav \
+  url=https://dav.example.com/remote.php/dav/files/you \
+  vendor=other user=YOU pass=SECRET
 ```
 
-### First run and the session file
-
-The first run prompts for your phone, the login code Telegram sends you, and your
-2FA password if you have one. Later runs are non-interactive.
-
-The session file defaults to
-`${XDG_STATE_HOME:-~/.local/state}/tg-export/default.session` — **outside the
-repo**, so the safe location needs no opt-in. It and every SQLite sibling are mode
-`0600`, enforced by a `umask(0o077)` set before anything can create a file, plus a
-post-login assertion. A `chmod` after connecting would be too late: SQLite writes
-the auth key *during* login.
-
-If you point `--session` or `--out` inside a git repo at a path that is not
-gitignored, the run refuses with an explanation. Deleting a session file does
-**not** revoke it server-side — use Telegram → Settings → Devices for that.
-
-## Output layout
-
-```
-exports/g-1001234567890/     <- directory name is the chat id, never the group title
-  title.txt                  <- the human-readable name lives here, as data
-  1042/                      <- one album (shared grouped_id); folder = first member id
-    1042_photo.jpg           <- filename keyed on message id, not a positional index
-    1043_photo.jpg
-    1044_video.mp4
-  1047/                      <- a standalone message
-    1047_document.pdf
-  messages.jsonl
-  .export-state.json
-  .export.lock
-```
-
-The directory is `g<chat_id>` and not the group title because the title is
-server-supplied and editable by any admin. A title of `..` or `a/b` would be a
-path-traversal vector that no filename sanitizer could catch, since the escape
-happens in a parent component. Naming the directory after an int makes that
-structurally impossible — and also means a mid-export group rename cannot orphan
-your download. The cost is that `ls exports/` shows numbers.
-
-Filenames are keyed on the **message id** rather than a position in the album,
-because a positional index shifts when a member message is deleted between runs,
-silently orphaning files already on disk.
-
-## Resume semantics
-
-`.export-state.json` holds one cursor, and it means:
-
-> every post with `max_message_id <= cursor_id` has been handled **under these
-> filters**.
-
-Consequences worth knowing:
-
-- The cursor is written only after a post is completely handled, and never from an
-  error path. It can never point past in-flight work.
-- Filters are stored verbatim. Changing them refuses the run and prints exactly
-  what changed, because the cursor's meaning depends on them:
-
-  ```
-  filter mismatch:
-    types:       ['photo', 'video'] -> ['video']
-    max_size:    100000000 -> (none)
-  re-run with the original filters, or --reset-state to start over
-  ```
-
-- `--reset-state` discards the cursor and rotates `messages.jsonl` to
-  `messages-<utc-timestamp>.jsonl`. It does **not** delete downloaded files —
-  dedupe reclaims them on the next run, and deleting 30 GB to change a filter
-  would be hostile.
-- `--limit N` is *not* part of the filter set. It changes when we stop, not what a
-  post contains, so a `--limit 20` test run is a genuine resumable partial export
-  that does not poison later full runs.
-- `completed_at` is set only when a run exhausts the history cleanly. It is the
-  only way to answer "did my 20-hour export actually finish?".
-- **A file that fails is recorded and skipped, and the cursor moves past it.** The
-  run continues and the exit summary names the count (`N files failed (see
-  messages.jsonl)`). Media that was deleted or expired is genuinely gone, but a
-  file that exhausted its retries is not re-attempted by a later resume — grep
-  `errors` in `messages.jsonl` to find them, and use `--reset-state` to re-drive
-  that range if it matters.
-
-## `messages.jsonl`
-
-```json
-{"message_id":1043,"post_id":1042,"grouped_id":88,"date":"2026-07-04T12:00:00+00:00",
- "sender_id":777,"sender_name":"Alice","caption":"beach trip","reply_to":1001,
- "files":[{"path":"1042/1043_photo.jpg","size":1234567,"name":"photo.jpg",
-           "mime":"image/jpeg","kind":"photo","declared_size":1234999}],
- "errors":[]}
-```
-
-**Each record is an append-only event: "the files written for this message in this
-run."** So the correct way to read the sidecar is the **union of all records for a
-`message_id`**, never last-write-wins — after a filter change, the most recent
-record deliberately describes a narrower slice than what is on disk.
-
-- `size` is bytes on disk; `declared_size` appears only when the server's number
-  differs (see the photo note below).
-- Paths are relative to the export root.
-- `sender_name` is filled in only when the sender was already cached. Resolving it
-  otherwise would mean one extra RPC per message — 100k RPCs and a flood ban on a
-  large group, in exchange for a display string.
-- A partial final line from a host crash is truncated and warned about at startup.
-- With `--include-text`, text-only messages get the same record shape with
-  `"files": []`. Distinguish media from context by `files` being empty, not by a
-  record type.
-
-## Flags
-
-```
-tg-export --group <id|@username|link> --out DIR
-          [--dry-run] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
-          [--types photo,video,document,audio,voice] [--max-size 100MB]
-          [--include-text] [--limit N] [--session PATH] [--reset-state]
-          [--min-free 2GiB] [--max-flood-wait SECONDS] [--verbose]
-```
-
-- `--include-text` is off by default. When set, text-only messages are recorded in
-  the sidecar with an empty `files[]` so captions and replies keep their
-  surrounding conversation. They never create a folder and never download
-  anything. It **is** part of the stored filter set — it changes what a post
-  contains — so toggling it requires `--reset-state`.
-- `--verbose` raises the log level for *this tool only*. The `telethon` logger is
-  pinned at `WARNING` unconditionally, because its request logging carries
-  `api_id`, `phone_number` and `phone_code_hash`. There is deliberately no
-  `--debug-telethon`.
-- A link preview is not media: a message containing a URL is not treated as an
-  attachment, so preview thumbnails are never downloaded.
-
-## Flood waits have no ceiling by default
-
-Telegram throttles by telling the client to wait, and those waits escalate from
-seconds to hours if you keep pushing. By default `tg-export` **sleeps as long as
-Telegram demands**, so an unattended export completes rather than failing fast.
-
-Every wait is logged at `WARNING` with its duration **and its computed wake
-time**:
-
-```
-2026-08-11 07:42:11 WARNING flood wait 3600s - sleeping until 2026-08-11T08:42:11+00:00
-```
-
-A long sleep is a sleep, not a hang. Read the log before assuming otherwise. Pass
-`--max-flood-wait SECONDS` to exit cleanly and resumably (code 6) instead.
-
-## Why downloads are sequential
-
-Telethon does not parallelize a single transfer, and running several at once
-mainly accelerates flood-wait escalation — a 7-second wait becomes a 4-hour
-lockout. There is deliberately no `--workers` flag, and an AST test in the suite
-fails if `gather`, `create_task`, `to_thread` or a thread pool ever appears in
-`src/`.
-
-## Disk space
-
-`--dry-run` reports remaining posts, files and bytes by media type against free
-space, and exits 2 if it will not fit.
-
-**That verdict is advisory.** The enforcement is a per-file check before each
-download, comparing free space against *this file's* size plus the `--min-free`
-reserve. So a `SHORT` verdict does not mean the run is unsafe — it means the run
-will stop partway with a clean, resumable cursor.
-
-Photo totals are labelled approximate because a photo's declared `.size`
-describes the size variant Telethon selected. Documents, video and audio carry an
-exact size. Media reporting no size at all is downloaded anyway and counted on its
-own `unknown size` line rather than as zero, so the estimate never hides an
-unbounded error.
-
-`--dry-run` reads the cursor and measures from where a real run would start, so
-`tg-export --dry-run && tg-export` works on a partially completed export. It takes
-no export lock, creates no directories, and mutates nothing. It does open the
-session file, so running it alongside an export in progress needs its own
-`--session` — see [Concurrent runs](#concurrent-runs).
-
-## Concurrent runs
-
-One run per export root. A second run against the same `--out` exits 3 and names
-the holder's pid, host and start time. `flock` releases on process death, `kill -9`
-included, so there is no stale lock to clean up.
-
-Exporting two *different* groups at the same time works, but each needs its own
-`--session` as well as its own `--out`: the session file is a SQLite database and
-is locked too, because two Telethon clients sharing one session is a corruption
-hazard Telethon itself warns about.
-
-`--dry-run` takes no *export* lock, so it never contends for an export root. It
-does open the session file and therefore takes the session lock: to run it
-alongside an export in progress, give it its own `--session`.
-
-Both locks are `flock`-based. On NFS and some network filesystems `flock` is
-advisory-only or silently per-client, so single-instance enforcement is not
-guaranteed there — keep the session file and the export root on local storage.
-
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| 0 | success |
-| 1 | unexpected error |
-| 2 | `--dry-run` says it will not fit, **or** a bad/missing argument — argparse exits 2 too |
-| 3 | disk exhausted, or another run holds the lock |
-| 4 | session invalidated — re-login |
-| 5 | lost access to the group |
-| 6 | flood wait exceeded `--max-flood-wait` (only when you set it) |
-| 7 | filter or chat mismatch against the existing state file |
-| 130 | interrupted — re-run to resume |
-
-## Development
+Pipeline (bash):
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt -e ".[dev]"
-.venv/bin/python -m pytest              # 214 tests, ~3 s
+tdl dl -f export.json -d ./staging --takeout --group --skip-same --continue &
+TDL_PID=$!
+while kill -0 "$TDL_PID" 2>/dev/null; do
+  rclone move ./staging tg-webdav:tg-export --min-age 2m --delete-empty-src-dirs
+  sleep 60
+done
+rclone move ./staging tg-webdav:tg-export --delete-empty-src-dirs   # final sweep
 ```
 
-The whole suite runs offline against synthetic message stubs — no credentials, no
-network. Note that `messages.jsonl` contains message text and sender names from
-other people; the export tree is gitignored and the runtime check refuses an
-un-ignored path inside a repo, but check `git status` before any commit.
+Pipeline (PowerShell):
+
+```powershell
+$tdl = Start-Process tdl -ArgumentList 'dl','-f','export.json','-d','./staging','--takeout','--group','--skip-same','--continue' -PassThru -NoNewWindow
+while (-not $tdl.HasExited) {
+  rclone move ./staging tg-webdav:tg-export --min-age 2m --delete-empty-src-dirs
+  Start-Sleep -Seconds 60
+}
+rclone move ./staging tg-webdav:tg-export --delete-empty-src-dirs
+```
+
+Why it works:
+
+- `--min-age 2m` keeps rclone away from files tdl is still writing; the final
+  sweep after tdl exits catches everything else.
+- Both legs are independently resumable: re-run tdl (`--skip-same --continue`)
+  and re-run the rclone loop; nothing is downloaded or uploaded twice.
+- Caveat: `--skip-same` compares name+size against the **staging** dir, which
+  is empty after files move to WebDAV. Cross-run dedupe therefore rests on
+  `--continue` (tdl's own completion tracking) — keep the same `export.json`
+  between runs. If you restart with a fresh export, narrow it to the missing
+  message-id range (`-T id -i <last>,<max>`) instead of re-downloading
+  everything.
+
+**Zero-staging streaming (no local disk at all) is not possible with tdl.** It
+requires custom code that pipes download chunks straight into a WebDAV `PUT` —
+both Telethon (`iter_download`) and gotd (`Stream(ctx, w)`) support that; see
+the reports in `plans/reports/` if you ever need to build it.
+
+## The retired implementation
+
+A complete, tested (214 offline tests) Python/Telethon exporter with per-post
+album folders, a `messages.jsonl` sidecar, resumable cursor semantics and a
+dry-run size estimator lives at commit `3286ee2`:
+
+```bash
+git show 3286ee2:README.md              # its documentation
+git checkout 3286ee2 -- src tests pyproject.toml requirements.txt   # resurrect it
+```
+
+It is unmaintained and pins Telethon `<2`; expect bit-rot.
