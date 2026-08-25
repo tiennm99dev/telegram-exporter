@@ -81,6 +81,34 @@ done
 rclone move ./staging tg-webdav:tg-export --delete-empty-src-dirs   # final sweep
 ```
 
+This repo ships that loop as **`tg-export-webdav.sh`**, hardened for unattended
+runs:
+
+```bash
+./tg-export-webdav.sh -r tg-webdav:tg-export -c @mygroup      # export, then pipeline
+./tg-export-webdav.sh -r tg-webdav:tg-export -- -t 4 -l 1     # pass flags to tdl dl
+./tg-export-webdav.sh -h                                      # all options
+```
+
+What it adds over the loop above:
+
+- Checks `tdl`, `rclone` and remote reachability before downloading anything.
+- Excludes tdl's `*.tmp` partials from every sweep. tdl downloads to
+  `<name>.tmp` and renames on completion, so a download stalled by a flood wait
+  stops touching its `.tmp`; age alone would let rclone upload it half-written
+  and destroy the resume point for that file.
+- Defers `--delete-empty-src-dirs` to the final sweep, and recreates the staging
+  dir after every sweep. rclone removing a directory under a running tdl makes
+  tdl fail to create its next file.
+- Stops `tdl` on Ctrl-C, `SIGTERM` or its own exit, so no download is orphaned,
+  and propagates tdl's exit code (`130`/`143` interrupted, `3` rclone failure,
+  `2` usage error).
+- Runs the unrestricted final sweep **only** after tdl exits 0, and reports it
+  loudly if it fails. An interrupted or crashed run gets the `--min-age`-guarded
+  sweep instead and keeps the staging dir for resume.
+- Aborts if rclone fails 5 sweeps in a row, instead of silently letting staging
+  grow until the disk fills.
+
 Pipeline (PowerShell):
 
 ```powershell
@@ -96,6 +124,11 @@ Why it works:
 
 - `--min-age 2m` keeps rclone away from files tdl is still writing; the final
   sweep after tdl exits catches everything else.
+- **Add `--exclude '*.tmp'` to both `rclone move` calls in the loops above.**
+  tdl writes `<name>.tmp` and renames on completion, so age is not a reliable
+  completion signal: a download stalled by a flood wait stops touching its
+  `.tmp`, and the loops as written will upload that partial file and delete the
+  local copy, breaking `--continue` for it. `tg-export-webdav.sh` does this.
 - Both legs are independently resumable: re-run tdl (`--skip-same --continue`)
   and re-run the rclone loop; nothing is downloaded or uploaded twice.
 - Caveat: `--skip-same` compares name+size against the **staging** dir, which
@@ -108,7 +141,7 @@ Why it works:
 **Zero-staging streaming (no local disk at all) is not possible with tdl.** It
 requires custom code that pipes download chunks straight into a WebDAV `PUT` —
 both Telethon (`iter_download`) and gotd (`Stream(ctx, w)`) support that; see
-the reports in `plans/reports/` if you ever need to build it.
+the reports in `plans/reports/` at commit `3286ee2` if you ever need to build it.
 
 ## The retired implementation
 
