@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # Rolling pipeline: tdl downloads Telegram media into a small staging directory
-# while rclone concurrently moves finished files to a WebDAV remote. Local disk
-# only ever holds the files in flight plus one sync interval of throughput, so a
-# group larger than the local disk can still be exported.
+# while rclone concurrently moves finished files to any rclone remote (S3,
+# Google Drive, SFTP, WebDAV, B2, ...). Local disk only ever holds the files in
+# flight plus one sync interval of throughput, so a chat larger than the local
+# disk can still be exported.
 #
-# See README.md ("Special case: exporting to WebDAV") for the background.
+# See README.md for the background.
 #
 # Exit codes: 0 ok, 2 usage error, 3 rclone failure, 130/143 interrupted,
 # anything else is tdl's own exit code.
@@ -34,7 +35,7 @@ usage() {
 Usage: $PROG -r REMOTE:PATH [options] [-- extra tdl dl args...]
 
 Required:
-  -r REMOTE:PATH  rclone destination, e.g. tg-webdav:tg-export
+  -r REMOTE:PATH  rclone destination, e.g. gdrive:telegram/media
 
 Options:
   -f FILE         tdl export JSON (default: $export_file)
@@ -46,7 +47,7 @@ Options:
   -h              this help
 
 Everything after -- is appended to the 'tdl dl' command, e.g.
-  $PROG -r tg-webdav:tg-export -- -t 4 -l 1
+  $PROG -r gdrive:telegram/media -- -t 4 -l 1
 USAGE
 }
 
@@ -80,8 +81,21 @@ for tool in tdl rclone; do
   command -v "$tool" >/dev/null || die "$tool is not installed or not on PATH"
 done
 
-rclone lsd "${remote%%:*}:" >/dev/null 2>&1 \
-  || die "rclone cannot reach remote '${remote%%:*}:' — check 'rclone config'"
+# A named remote must exist in the config; a leading ':' means an on-the-fly
+# connection string, which has no config entry to check. Listing the remote's
+# root is not portable (some backends refuse it), so reachability and
+# credentials are proven by creating the destination, which rclone would create
+# on the first move anyway.
+if [[ $remote != :* ]]; then
+  # Read the list into a variable first: piping it into 'grep -q' lets grep exit
+  # on the first match and kill rclone with SIGPIPE, which pipefail then reports
+  # as a failed pipeline -- rejecting a remote that is in fact configured.
+  remotes=$(rclone listremotes 2>/dev/null || true)
+  grep -qx -- "${remote%%:*}:" <<<"$remotes" \
+    || die "rclone remote '${remote%%:*}:' is not configured — see 'rclone listremotes'"
+fi
+rclone mkdir "$remote" >/dev/null 2>&1 \
+  || die "cannot reach '$remote' — check credentials and connectivity"
 
 # The export JSON only lists messages; it is cheap to keep and required for both
 # legs to stay resumable, so never regenerate it when it already exists.
