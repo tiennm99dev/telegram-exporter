@@ -1,157 +1,124 @@
-# telegram-exporter — ⚠️ churned
+# telegram-exporter
 
-**Status: churned as of 2026-08-25. No further development, no maintenance, no
-issue support.** This repo now contains only these instructions; the retired
-Python implementation lives in git history (see the last section).
+Export a Telegram chat's media to a **WebDAV** server, using far less local disk
+than the chat's total size.
 
-## Why
+`run.sh` runs [tdl](https://github.com/iyear/tdl) and
+[rclone](https://rclone.org/) as a rolling pipeline: tdl downloads into a small
+staging directory while rclone concurrently moves finished files to WebDAV and
+deletes the local copies. Local disk only ever holds the files in flight plus
+one sync interval of throughput, so a multi-terabyte chat exports fine on a
+small disk. Telegram caps a single file at 2 GB (4 GB from premium uploaders),
+so a few dozen GB of staging covers the worst case regardless of chat size.
 
-[iyear/tdl](https://github.com/iyear/tdl) — an actively maintained Telegram
-toolkit in Go, built on [gotd/td](https://github.com/gotd/td) — already covers
-this project's purpose: export chat history and download media from DMs, groups
-and channels over MTProto with a user account (so neither Bot API limit applies:
-it can read history, and there is no 20 MB download cap). Maintaining a parallel
-tool is not justified.
+This is needed because **tdl can only write to a local directory** — it has no
+rclone integration and no remote destination of any kind (`tdl dl -d` takes a
+filesystem path; `tdl --storage` is its session database, not an output target).
+tdl downloads over MTProto with a user account, so Bot API limits do not apply:
+full history is readable and there is no 20 MB download cap.
 
-In short: a gotd-based rewrite was researched and judged feasible but not
-worth it, since tdl already exists and is proven; the original project's
-research and build reports are in git history at commit `3286ee2`.
+## Requirements
 
-## Use tdl instead
+- **tdl** — <https://docs.iyear.me/tdl/getting-started/installation/>
+- **rclone** — <https://rclone.org/install/>
+- **bash**. On Windows, run under WSL or Git Bash.
 
-Install: see <https://docs.iyear.me/tdl/getting-started/installation/>.
+## Setup
 
-```bash
-tdl login                                   # user-account login (phone + code + 2FA)
-
-# 1) export message metadata to JSON
-tdl chat export -c @mygroup --all --with-content -o export.json
-
-# 2) download the media it references
-tdl dl -f export.json -d ./exports --takeout --group --skip-same --continue
-```
-
-Flag notes, mapped to what this project used to do:
-
-- `--takeout` — takeout session with lower flood-wait limits for bulk export
-  (an improvement this project never had).
-- `--group` — detect albums (`grouped_id`) and download grouped messages together.
-- `--skip-same` + `--continue` — resume: skip files matching existing name+size,
-  continue interrupted downloads without prompting.
-- `--all --with-content` — include text-only messages with their content
-  (equivalent of `--include-text`).
-- Filters: time range / message-id range via `-i`, plus expression filters, e.g.
-  `-f "Media.Size > 5*1024*1024"`. Extension filters via `-i jpg,png` / `-e mp4`.
-- tdl defaults to aggressive parallelism (`-t 8 -l 4`). If you hit flood waits
-  on a large export, lower it (`-t 4 -l 1`).
-
-What tdl does **not** replicate from this project's contract: per-post album
-folders keyed on message id, the `messages.jsonl` append-only sidecar, the
-cursor with filter-mismatch refusal, and the dry-run disk estimate. If you need
-those guarantees, the old implementation is in this repo's history and `src/`.
-
-## Special case: exporting to WebDAV
-
-tdl can only write to a local directory — it has no WebDAV (or any remote)
-destination. When the group's media is larger than local disk, use a **rolling
-pipeline**: tdl downloads into a small staging directory while
-[rclone](https://rclone.org/) concurrently moves (upload + delete local)
-finished files to WebDAV. Local disk then only needs to hold the files
-currently in flight plus one sync interval of throughput — Telegram caps a
-single file at 2 GB (4 GB from premium uploaders), so a few dozen GB of staging
-covers the worst case regardless of the group's total size.
-
-One-time rclone remote setup:
+Both steps are one-time.
 
 ```bash
+# 1) log in to Telegram with your user account (phone + code + 2FA)
+tdl login
+
+# 2) create the WebDAV remote
 rclone config create tg-webdav webdav \
   url=https://dav.example.com/remote.php/dav/files/you \
   vendor=other user=YOU pass=SECRET
+
+rclone lsd tg-webdav:      # verify it works
 ```
 
-Pipeline (bash):
+## Usage
 
 ```bash
-tdl dl -f export.json -d ./staging --takeout --group --skip-same --continue &
-TDL_PID=$!
-while kill -0 "$TDL_PID" 2>/dev/null; do
-  rclone move ./staging tg-webdav:tg-export --min-age 2m --delete-empty-src-dirs
-  sleep 60
-done
-rclone move ./staging tg-webdav:tg-export --delete-empty-src-dirs   # final sweep
+./run.sh -r tg-webdav:tg-export -c @mygroup
 ```
 
-This repo ships that loop as **`tg-export-webdav.sh`**, hardened for unattended
-runs:
+That is the whole flow. It exports the chat's message metadata to
+`export.json`, then downloads and uploads concurrently until finished. Progress
+and warnings go to stderr; press Ctrl-C at any point and it stops cleanly.
+
+### Options
+
+| Flag | Meaning |
+|------|---------|
+| `-r REMOTE:PATH` | **Required.** rclone destination, e.g. `tg-webdav:tg-export` |
+| `-c CHAT` | Chat to export when the JSON does not exist yet: `@username` or a numeric chat id |
+| `-f FILE` | Export JSON to download from (default `export.json`) |
+| `-d DIR` | Staging directory (default `./staging`) |
+| `-i SECONDS` | Seconds between rclone sweeps (default `60`) |
+| `-a AGE` | rclone `--min-age`, a second guard against moving files still being written (default `2m`) |
+| `-h` | Help |
+
+Anything after `--` is passed straight to `tdl dl`:
 
 ```bash
-./tg-export-webdav.sh -r tg-webdav:tg-export -c @mygroup      # export, then pipeline
-./tg-export-webdav.sh -r tg-webdav:tg-export -- -t 4 -l 1     # pass flags to tdl dl
-./tg-export-webdav.sh -h                                      # all options
+./run.sh -r tg-webdav:tg-export -- -t 4 -l 1      # calmer parallelism, fewer flood waits
+./run.sh -r tg-webdav:tg-export -- -i mp4,mkv     # only these file extensions
+./run.sh -r tg-webdav:tg-export -- -e jpg,png     # skip these file extensions
 ```
 
-What it adds over the loop above:
+tdl defaults to `-t 8 -l 4`, which is aggressive; lower it if you hit flood
+waits on a large export.
 
-- Checks `tdl`, `rclone` and remote reachability before downloading anything.
-- Excludes tdl's `*.tmp` partials from every sweep. tdl downloads to
-  `<name>.tmp` and renames on completion, so a download stalled by a flood wait
-  stops touching its `.tmp`; age alone would let rclone upload it half-written
-  and destroy the resume point for that file.
-- Defers `--delete-empty-src-dirs` to the final sweep, and recreates the staging
-  dir after every sweep. rclone removing a directory under a running tdl makes
-  tdl fail to create its next file.
-- Stops `tdl` on Ctrl-C, `SIGTERM` or its own exit, so no download is orphaned,
-  and propagates tdl's exit code (`130`/`143` interrupted, `3` rclone failure,
-  `2` usage error).
-- Runs the unrestricted final sweep **only** after tdl exits 0, and reports it
-  loudly if it fails. An interrupted or crashed run gets the `--min-age`-guarded
-  sweep instead and keeps the staging dir for resume.
-- Aborts if rclone fails 5 sweeps in a row, instead of silently letting staging
-  grow until the disk fills.
+### Exporting a subset
 
-Pipeline (PowerShell):
-
-```powershell
-$tdl = Start-Process tdl -ArgumentList 'dl','-f','export.json','-d','./staging','--takeout','--group','--skip-same','--continue' -PassThru -NoNewWindow
-while (-not $tdl.HasExited) {
-  rclone move ./staging tg-webdav:tg-export --min-age 2m --delete-empty-src-dirs
-  Start-Sleep -Seconds 60
-}
-rclone move ./staging tg-webdav:tg-export --delete-empty-src-dirs
-```
-
-Why it works:
-
-- `--min-age 2m` keeps rclone away from files tdl is still writing; the final
-  sweep after tdl exits catches everything else.
-- **Add `--exclude '*.tmp'` to both `rclone move` calls in the loops above.**
-  tdl writes `<name>.tmp` and renames on completion, so age is not a reliable
-  completion signal: a download stalled by a flood wait stops touching its
-  `.tmp`, and the loops as written will upload that partial file and delete the
-  local copy, breaking `--continue` for it. `tg-export-webdav.sh` does this.
-- Both legs are independently resumable: re-run tdl (`--skip-same --continue`)
-  and re-run the rclone loop; nothing is downloaded or uploaded twice.
-- Caveat: `--skip-same` compares name+size against the **staging** dir, which
-  is empty after files move to WebDAV. Cross-run dedupe therefore rests on
-  `--continue` (tdl's own completion tracking) — keep the same `export.json`
-  between runs. If you restart with a fresh export, narrow it to the missing
-  message-id range (`-T id -i <last>,<max>`) instead of re-downloading
-  everything.
-
-**Zero-staging streaming (no local disk at all) is not possible with tdl.** It
-requires custom code that pipes download chunks straight into a WebDAV `PUT` —
-both Telethon (`iter_download`) and gotd (`Stream(ctx, w)`) support that; see
-the reports in `plans/reports/` at commit `3286ee2` if you ever need to build it.
-
-## The retired implementation
-
-A complete, tested (214 offline tests) Python/Telethon exporter with per-post
-album folders, a `messages.jsonl` sidecar, resumable cursor semantics and a
-dry-run size estimator lives at commit `3286ee2`:
+Generate the JSON yourself when you want a narrower export, then point `-f` at
+it:
 
 ```bash
-git show 3286ee2:README.md              # its documentation
-git checkout 3286ee2 -- src tests pyproject.toml requirements.txt   # resurrect it
+tdl chat export -c @mygroup -T id -i 1000,5000 --all --with-content -o part.json
+./run.sh -r tg-webdav:tg-export -f part.json
 ```
 
-It is unmaintained and pins Telethon `<2`; expect bit-rot.
+`tdl chat export` takes `-T time|id|last` with `-i` as the range, and `-f` as an
+expression filter over message fields (`-f -` lists the available fields).
+
+## Resuming
+
+Re-run the same command. Both legs resume independently and nothing is
+downloaded or uploaded twice.
+
+Keep the same `export.json` between runs: `--skip-same` compares against the
+**staging** directory, which is empty once files have moved to WebDAV, so
+cross-run deduplication rests on tdl's own `--continue` tracking. If you must
+start from a fresh export, narrow it to the missing message-id range
+(`-T id -i <last>,<max>`) rather than re-downloading everything.
+
+## What it guards against
+
+- **Partial uploads.** tdl writes `<name>.tmp` and renames on completion, so
+  every sweep excludes `*.tmp`. Age alone is not a completion signal: a download
+  stalled by a flood wait stops touching its `.tmp`, which would then be
+  uploaded half-written and lose its resume point.
+- **Directories vanishing under tdl.** `--delete-empty-src-dirs` runs only in
+  the final sweep, and the staging directory is recreated after every sweep.
+  Removing a directory under a running tdl makes it fail to create its next file.
+- **Orphaned downloads.** tdl is stopped on exit, Ctrl-C, or `SIGTERM`, so no
+  download keeps running after the script is gone.
+- **A failed run looking finished.** The unrestricted final sweep happens only
+  after tdl exits 0. An interrupted or crashed run gets the age-guarded sweep
+  and keeps staging for the next attempt.
+- **A dead remote filling the disk.** Five consecutive rclone failures abort the
+  run instead of letting staging grow unbounded.
+
+Exit codes: `0` success, `2` usage error, `3` rclone failure, `130`/`143`
+interrupted, anything else is tdl's own exit code.
+
+## Limits
+
+- Streaming with no staging at all (piping download chunks straight into a
+  WebDAV `PUT`) is not possible with tdl and would require custom code.
+- The script is bash; the two tools it drives are cross-platform, but Windows
+  needs WSL or Git Bash.
