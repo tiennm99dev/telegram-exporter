@@ -22,7 +22,7 @@ readonly PROG=${0##*/}
 readonly TEMP_GLOB='*.tmp'
 
 # Defaults
-export_file='export.json'
+export_file=''      # decided after parsing: per-chat when -c is given
 chat=''
 staging='./staging'
 remote=''
@@ -38,8 +38,12 @@ Required:
   -r REMOTE:PATH  rclone destination, e.g. gdrive:telegram/media
 
 Options:
-  -f FILE         tdl export JSON (default: $export_file)
-  -c CHAT         chat to export when FILE does not exist, e.g. @mygroup
+  -f FILE         tdl export JSON (default: export-<chat>.json with -c,
+                  otherwise export.json)
+  -c CHAT         chat to export when FILE does not exist. Accepts a numeric
+                  id as printed by 'tdl chat ls', a username with or without
+                  '@', or a t.me/tg:// link. A Bot API '-100...' id is
+                  converted to the plain id tdl expects.
   -d DIR          staging directory (default: $staging)
   -i SECONDS      seconds between rclone sweeps (default: $interval)
   -a AGE          rclone --min-age, a second guard against moving files still
@@ -77,6 +81,35 @@ tdl_extra=("$@")
 [[ $min_age =~ ^[0-9]+(\.[0-9]+)?(ms|s|m|h|d|w|M|y)?$ ]] \
   || die "-a must be an rclone duration, e.g. 2m"
 
+# tdl resolves a numeric argument as an MTProto id and anything else through
+# gotd's resolver, which handles '@name', 'name' and t.me/tg:// links. Two forms
+# still need help: Bot API ids carry a '-100' prefix that MTProto does not use,
+# and a message link is not a chat.
+if [[ -n $chat ]]; then
+  read -r chat <<<"$chat"        # trim stray whitespace
+  case $chat in
+    '') die "-c requires a chat" ;;
+    *t.me/c/*|*t.me/*/[0-9]*)
+      die "-c takes a chat, not a message link ($chat) — pass the chat's username or id" ;;
+    -100[0-9]*)
+      log "converting Bot API id $chat to MTProto id ${chat#-100}"
+      chat=${chat#-100} ;;
+  esac
+fi
+
+# Keep each chat's export in its own file, so switching -c never silently
+# downloads the previous chat again from a stale export.json.
+if [[ -z $export_file ]]; then
+  if [[ -n $chat ]]; then
+    slug=${chat#@}
+    slug=${slug##*/}
+    slug=$(printf '%s' "$slug" | tr -c 'A-Za-z0-9._-' '_')
+    export_file="export-$slug.json"
+  else
+    export_file='export.json'
+  fi
+fi
+
 for tool in tdl rclone; do
   command -v "$tool" >/dev/null || die "$tool is not installed or not on PATH"
 done
@@ -103,6 +136,8 @@ if [[ ! -f $export_file ]]; then
   [[ -n $chat ]] || die "$export_file not found; pass -c CHAT to export it first"
   log "exporting $chat metadata to $export_file"
   tdl chat export -c "$chat" --all --with-content -o "$export_file"
+else
+  log "using existing $export_file (delete it to re-export)"
 fi
 
 mkdir -p "$staging"

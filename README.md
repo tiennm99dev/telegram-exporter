@@ -62,12 +62,42 @@ and warnings go to stderr; press Ctrl-C at any point and it stops cleanly.
 | Flag | Meaning |
 |------|---------|
 | `-r REMOTE:PATH` | **Required.** rclone destination, e.g. `gdrive:telegram/media`, `s3:bucket/tg`, `dav:tg-export` |
-| `-c CHAT` | Chat to export when the JSON does not exist yet: `@username` or a numeric chat id |
-| `-f FILE` | Export JSON to download from (default `export.json`) |
+| `-c CHAT` | Chat to export when the JSON does not exist yet — id, username, or link (see below) |
+| `-f FILE` | Export JSON to download from (default `export-<chat>.json` with `-c`, else `export.json`) |
 | `-d DIR` | Staging directory (default `./staging`) |
 | `-i SECONDS` | Seconds between rclone sweeps (default `60`) |
 | `-a AGE` | rclone `--min-age`, a second guard against moving files still being written (default `2m`) |
 | `-h` | Help |
+
+### Identifying the chat
+
+`-c` accepts every form tdl understands, plus one it doesn't:
+
+| Form | Example |
+|------|---------|
+| Numeric id, as printed by `tdl chat ls` | `-c 1697797156` |
+| Username, with or without `@` | `-c @mygroup` / `-c mygroup` |
+| Public link | `-c https://t.me/mygroup` / `-c t.me/mygroup` |
+| Deep link | `-c 'tg://resolve?domain=mygroup'` |
+| **Bot API id** (converted for you) | `-c -1001697797156` → `1697797156` |
+
+tdl resolves a numeric argument as an MTProto id and anything else through
+gotd's resolver. MTProto has no `-100` prefix, so a Bot API id would otherwise
+fail to resolve; the script strips it and logs the conversion.
+
+A **message** link is rejected — `-c` names a chat, not a message:
+
+```
+$ ./run.sh -r gdrive:tg -c https://t.me/mygroup/123
+error: -c takes a chat, not a message link — pass the chat's username or id
+```
+
+Run `tdl chat ls` to see ids and usernames side by side.
+
+Each chat gets its own export file by default (`export-mygroup.json`,
+`export-1697797156.json`), so exporting a second chat from the same directory
+never reuses the first one's JSON. When the file already exists it is reused and
+the script says so — delete it to re-export.
 
 Anything after `--` is passed straight to `tdl dl`:
 
