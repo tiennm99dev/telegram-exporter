@@ -1,0 +1,16 @@
+# tdl chat exports and the narrowed subsets built from them. These hold real
+# message ids, file names and text from an account, and are specific to one run.
+# The repo ships no JSON of its own, so the whole extension is excluded.
+*.json
+
+# Ids still to fetch, written by verify-export.sh.
+missing-ids.txt
+
+# Staging holds media in flight between tdl and the remote.
+staging/
+
+# Run logs carry chat names and progress output.
+*.log
+
+# Session plans and reports.
+plans/

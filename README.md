@@ -143,6 +143,63 @@ cross-run deduplication rests on tdl's own `--continue` tracking. If you must
 start from a fresh export, narrow it to the missing message-id range
 (`-T id -i <last>,<max>`) rather than re-downloading everything.
 
+## Verifying an export
+
+`run.sh` finishes when tdl finishes, which is not the same as every file having
+arrived: a dropped session, a stalled remote, or an interrupted pass all leave
+gaps. `verify-export.sh` settles it by rebuilding the filename tdl produces for
+each media message in the export JSON and checking the remote for it.
+
+```bash
+./verify-export.sh -f export-mygroup.json -r remote:telegram/media
+```
+
+```
+messages in export : 18193
+  text-only (skip) : 38
+  media expected   : 12000
+present and intact : 12000
+  absent           : 0
+  zero-byte        : 0
+
+COMPLETE: every media message is present and non-empty.
+```
+
+Messages with no media are skipped; they carry an empty `file` and were never
+download targets. A zero-byte file counts as missing, because rclone overwrites a
+size-mismatched destination and a retry repairs it. Files under 1 KiB are
+reported but not retried, since some real media is genuinely that small. Exit
+status is 0 when complete and 1 otherwise, with the outstanding message ids
+written to `missing-ids.txt`.
+
+## Running until complete
+
+`export-until-complete.sh` drives `run.sh` in a loop: verify what is already
+there, narrow the export to the ids still missing, run the pipeline on that
+subset, and repeat.
+
+```bash
+./export-until-complete.sh -r remote:telegram/media -c @mygroup
+```
+
+| Flag | Meaning |
+|------|---------|
+| `-r REMOTE:PATH` | **Required.** rclone destination |
+| `-c CHAT` | Chat to export metadata for on the first pass |
+| `-f FILE` | Export JSON (default `export-<chat>.json`) |
+| `-d DIR` | Staging directory (default `./staging`) |
+| `-i SECONDS` | rclone sweep interval (default `300`) |
+| `-p N` | Maximum passes (default `20`) |
+| `-q GIB` | Stop if remote free space falls below this (default `5`) |
+
+It stops when the verifier reports complete (exit `0`), when a pass fetches
+nothing new (exit `1` — the remaining media is no longer available from
+Telegram), when the remote runs low on space (exit `3`), or on Ctrl-C (exit
+`130`, after the current pass shuts down cleanly).
+
+tdl's progress bar is shown when stdout is a terminal and suppressed when output
+is redirected, so a log file stays readable without a flag.
+
 ## What it guards against
 
 - **Partial uploads.** tdl writes `<name>.tmp` and renames on completion, so
