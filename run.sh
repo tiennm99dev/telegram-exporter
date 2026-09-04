@@ -27,7 +27,7 @@ chat=''
 staging='./staging'
 remote=''
 interval=60
-min_age='2m'
+min_age='45s'
 max_staging=''      # empty: staging grows as fast as tdl fills it
 max_sync_failures=5
 cap_check_interval=10   # seconds between -m checks, independent of -i
@@ -131,6 +131,15 @@ if [[ -z $export_file ]]; then
     export_file='export.json'
   fi
 fi
+
+# pikpak-style backends finish an upload as a server-side async task, and
+# rclone abandons a still-pending one once --low-level-retries polls run out,
+# failing a transfer that would have succeeded. Fewer parallel transfers keep
+# that queue short and more retries wait it out. These are rclone's own
+# environment variables, so whatever the caller already exported wins.
+: "${RCLONE_TRANSFERS:=2}"
+: "${RCLONE_LOW_LEVEL_RETRIES:=20}"
+export RCLONE_TRANSFERS RCLONE_LOW_LEVEL_RETRIES
 
 for tool in tdl rclone; do
   command -v "$tool" >/dev/null || die "$tool is not installed or not on PATH"

@@ -13,15 +13,15 @@
 #   -c CHAT         chat id/username, used for the initial metadata export
 #   -f FILE         export JSON (default export-<chat>.json)
 #   -d DIR          staging directory (default ./staging)
-#   -i SECONDS      rclone sweep interval (default 300)
-#   -p N            maximum passes (default 20)
+#   -i SECONDS      rclone sweep interval (default 120)
+#   -p N            maximum passes (default 30)
 #   -m SIZE         cap the staging directory at SIZE, e.g. 40G (default: no cap)
 #   -q GIB          stop if remote free space falls below this (default 5)
 
 set -euo pipefail
 
-remote='' chat='' export_file='' staging='./staging' interval=300 max_staging=''
-max_passes=20 min_free_gib=5
+remote='' chat='' export_file='' staging='./staging' interval=120 max_staging=''
+max_passes=30 min_free_gib=5
 
 while getopts ':r:c:f:d:i:p:q:m:h' o; do case $o in
   r) remote=$OPTARG ;;   c) chat=$OPTARG ;;      f) export_file=$OPTARG ;;

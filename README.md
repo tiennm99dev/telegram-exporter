@@ -66,7 +66,7 @@ and warnings go to stderr; press Ctrl-C at any point and it stops cleanly.
 | `-f FILE` | Export JSON to download from (default `export-<chat>.json` with `-c`, else `export.json`) |
 | `-d DIR` | Staging directory (default `./staging`) |
 | `-i SECONDS` | Seconds between rclone sweeps (default `60`) |
-| `-a AGE` | rclone `--min-age`, a second guard against moving files still being written (default `2m`) |
+| `-a AGE` | rclone `--min-age`, a second guard against moving files still being written (default `45s`) |
 | `-m SIZE` | Cap the staging directory at `SIZE` (`K`/`M`/`G`/`T`, binary), e.g. `40G`. Unset means no cap (see below) |
 | `-h` | Help |
 
@@ -119,6 +119,28 @@ side is tunable without touching the script:
 ```bash
 RCLONE_TRANSFERS=8 RCLONE_BWLIMIT=20M ./run.sh -r s3:bucket/tg -c @mygroup
 ```
+
+`run.sh` sets two of those itself, and only when the caller has not:
+
+| Variable | Default here | rclone's own default | Why |
+|----------|--------------|----------------------|-----|
+| `RCLONE_TRANSFERS` | `2` | `4` | Backends that commit an upload as a server-side async task queue those tasks; less parallelism keeps the queue short |
+| `RCLONE_LOW_LEVEL_RETRIES` | `20` | `10` | Each retry re-polls a pending task, so a slow commit is waited out instead of failing the transfer |
+
+Both exist because of one failure mode. On pikpak an upload finishes in two
+phases — rclone sends the bytes, then a server-side task must reach
+`PHASE_TYPE_COMPLETE`. rclone waits 500 ms and then polls, giving up after
+`--low-level-retries` attempts with:
+
+```
+ERROR : <file>: Failed to copy: can't verify the task is completed: ... Phase:"PHASE_TYPE_PENDING"
+```
+
+Nothing is lost when that happens — the message is followed by `Not deleting
+source as copy failed`, the file stays in staging and the next sweep retries
+it. But it wastes the upload, and it counts against a `-m` cap, since a file
+that keeps failing can never be drained. Raise the retries further if you still
+see it.
 
 ### Capping the staging directory
 
@@ -236,9 +258,9 @@ subset, and repeat.
 | `-c CHAT` | Chat to export metadata for on the first pass |
 | `-f FILE` | Export JSON (default `export-<chat>.json`) |
 | `-d DIR` | Staging directory (default `./staging`) |
-| `-i SECONDS` | rclone sweep interval (default `300`) |
+| `-i SECONDS` | rclone sweep interval (default `120`) |
 | `-m SIZE` | Staging cap passed through to `run.sh`, e.g. `40G` |
-| `-p N` | Maximum passes (default `20`) |
+| `-p N` | Maximum passes (default `30`) |
 | `-q GIB` | Stop if remote free space falls below this (default `5`) |
 
 It stops when the verifier reports complete (exit `0`), when a pass fetches
