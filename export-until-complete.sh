@@ -15,19 +15,20 @@
 #   -d DIR          staging directory (default ./staging)
 #   -i SECONDS      rclone sweep interval (default 300)
 #   -p N            maximum passes (default 20)
+#   -m SIZE         cap the staging directory at SIZE, e.g. 40G (default: no cap)
 #   -q GIB          stop if remote free space falls below this (default 5)
 
 set -euo pipefail
 
-remote='' chat='' export_file='' staging='./staging' interval=300
+remote='' chat='' export_file='' staging='./staging' interval=300 max_staging=''
 max_passes=20 min_free_gib=5
 
-while getopts ':r:c:f:d:i:p:q:h' o; do case $o in
+while getopts ':r:c:f:d:i:p:q:m:h' o; do case $o in
   r) remote=$OPTARG ;;   c) chat=$OPTARG ;;      f) export_file=$OPTARG ;;
   d) staging=$OPTARG ;;  i) interval=$OPTARG ;;  p) max_passes=$OPTARG ;;
-  q) min_free_gib=$OPTARG ;;
-  h) sed -n '2,18p' "$0"; exit 0 ;;
-  *) echo "usage: $0 -r REMOTE:PATH -c CHAT [-f FILE] [-i SECS] [-p N] [-q GIB]" >&2; exit 2 ;;
+  q) min_free_gib=$OPTARG ;; m) max_staging=$OPTARG ;;
+  h) sed -n '2,19p' "$0"; exit 0 ;;
+  *) echo "usage: $0 -r REMOTE:PATH -c CHAT [-f FILE] [-i SECS] [-p N] [-q GIB] [-m SIZE]" >&2; exit 2 ;;
 esac; done
 
 log() { printf '\n=== %s [driver] %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
@@ -97,6 +98,7 @@ PY
 
   rc=0
   ./run.sh -r "$remote" -f gap.json -d "$staging" -i "$interval" \
+    ${max_staging:+-m "$max_staging"} \
     -- --group=false -t 4 -l 2 ${tdl_quiet[@]+"${tdl_quiet[@]}"} || rc=$?
   log "pass $pass finished (run.sh exit $rc)"
 

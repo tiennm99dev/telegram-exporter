@@ -67,6 +67,7 @@ and warnings go to stderr; press Ctrl-C at any point and it stops cleanly.
 | `-d DIR` | Staging directory (default `./staging`) |
 | `-i SECONDS` | Seconds between rclone sweeps (default `60`) |
 | `-a AGE` | rclone `--min-age`, a second guard against moving files still being written (default `2m`) |
+| `-m SIZE` | Cap the staging directory at `SIZE` (`K`/`M`/`G`/`T`, binary), e.g. `40G`. Unset means no cap (see below) |
 | `-h` | Help |
 
 ### Identifying the chat
@@ -119,6 +120,29 @@ side is tunable without touching the script:
 RCLONE_TRANSFERS=8 RCLONE_BWLIMIT=20M ./run.sh -r s3:bucket/tg -c @mygroup
 ```
 
+### Capping the staging directory
+
+Without `-m`, staging grows whenever tdl downloads faster than rclone uploads,
+which on a fast connection and a slow remote can mean tens of GB between
+sweeps. `-m` puts a ceiling on it:
+
+```bash
+./run.sh -r s3:bucket/tg -c @mygroup -m 40G
+```
+
+Staging size is checked every 10 seconds, independently of `-i`. When it
+reaches the cap, tdl is suspended with `SIGSTOP` and rclone sweeps until
+staging is back under it, then tdl is resumed — it reconnects on its own and
+`--continue` picks its `.tmp` files back up. Because the checks are periodic,
+the cap is a high-water mark rather than a hard limit: staging can overshoot by
+up to ten seconds of download throughput before the gate closes.
+
+Only finished files can be drained, so the cap has to exceed what the
+concurrent downloads hold — at most `-l` times 2 GB (4 GB from premium
+uploaders). With the default `-l 2` anything from ~10 GB up is safe; below
+that, the drain cannot clear the cap and the run logs a warning on every check
+instead of throttling.
+
 ### Exporting a subset
 
 Generate the JSON yourself when you want a narrower export, then point `-f` at
@@ -131,6 +155,30 @@ tdl chat export -c @mygroup -T id -i 1000,5000 --all --with-content -o part.json
 
 `tdl chat export` takes `-T time|id|last` with `-i` as the range, and `-f` as an
 expression filter over message fields (`-f -` lists the available fields).
+
+## Sweep output
+
+The periodic sweeps are silent — they run every `-i` seconds alongside tdl's own
+output, and narrating each one would drown it. The sweeps that run **once at the
+end** do report progress, since they can move the whole staging directory with
+nothing else on screen:
+
+- the exit sweep on Ctrl-C, `SIGTERM`, or a tdl failure (`sweeping completed
+  files before exit`);
+- the final sweep after tdl finishes successfully.
+
+On a terminal that is rclone's redrawn `--progress` bar. When output is
+redirected to a log it becomes a one-line stats summary every 30s
+(`--stats 30s --stats-one-line --stats-log-level NOTICE`) — rclone logs stats at
+INFO, so raising just the stats to NOTICE avoids the line-per-file spam that
+`-v` would add.
+
+To show progress on every sweep instead, rclone reads its flags from the
+environment:
+
+```bash
+RCLONE_PROGRESS=true ./run.sh -r s3:bucket/tg -c @mygroup
+```
 
 ## Resuming
 
@@ -189,6 +237,7 @@ subset, and repeat.
 | `-f FILE` | Export JSON (default `export-<chat>.json`) |
 | `-d DIR` | Staging directory (default `./staging`) |
 | `-i SECONDS` | rclone sweep interval (default `300`) |
+| `-m SIZE` | Staging cap passed through to `run.sh`, e.g. `40G` |
 | `-p N` | Maximum passes (default `20`) |
 | `-q GIB` | Stop if remote free space falls below this (default `5`) |
 
@@ -216,6 +265,9 @@ is redirected, so a log file stays readable without a flag.
   and keeps staging for the next attempt.
 - **A dead remote filling the disk.** Five consecutive rclone failures abort the
   run instead of letting staging grow unbounded.
+- **A fast connection filling the disk.** With `-m`, tdl is suspended whenever
+  staging reaches the cap and resumed once rclone has drained it, so download
+  throughput cannot outrun the upload leg.
 - **Typos and bad credentials.** Before downloading anything, the remote must be
   present in `rclone listremotes` (skipped for connection strings) and the
   destination must be creatable, which proves both reachability and auth.
