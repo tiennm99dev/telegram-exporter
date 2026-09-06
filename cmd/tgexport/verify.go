@@ -29,13 +29,16 @@ import (
 func verifyCmd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	var (
-		chat      = fs.String("c", "", "chat id, username, or t.me link (required)")
-		remoteArg = fs.String("r", "", "rclone destination, e.g. pikpak:archive (required)")
-		ns        = fs.String("n", "default", "tdl session namespace")
-		dataDir   = fs.String("storage", tdlkv.DefaultDir(), "tdl bolt storage directory")
+		chat      = fs.String("c", "", "`CHAT`: id, username, or t.me link (required)")
+		remoteArg = fs.String("r", "", "rclone destination `REMOTE:PATH`, e.g. pikpak:archive (required)")
+		ns        = fs.String("n", "default", "tdl session `NAMESPACE`")
+		dataDir   = fs.String("storage", tdlkv.DefaultDir(), "`DIR` holding the tdl session store")
 		delStale  = fs.Bool("delete-misnamed", false, "delete remote files stored under a superseded name")
 		assumeYes = fs.Bool("y", false, "do not prompt before deleting")
 	)
+
+	commandUsage(fs, "tgexport verify -c CHAT -r REMOTE:PATH [options]",
+		"Compare a chat against a remote and report what is missing, empty,\nthe wrong size, or stored under a name that cannot be written.")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return err

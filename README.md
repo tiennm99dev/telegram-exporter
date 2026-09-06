@@ -204,16 +204,6 @@ semaphore. Some hard-won details were worth keeping, and are:
   `RCLONE_MIN_SIZE` left over from another job would otherwise narrow the index
   and re-download everything it hid.
 
-Flags that disappeared are recognised and explain what replaced them:
-
-| Old | Why it is gone |
-|---|---|
-| `-i` | no sweep interval; uploads start when a download finishes |
-| `-a` | no `--min-age`; completion is observed, not inferred |
-| `-f` | no export JSON; the chat is read live, so names cannot go stale |
-| `-p` | no passes; one invocation converges |
-| `-q` | renamed `--min-free` |
-
 ## Notes
 
 - `tgexport` and the `tdl` CLI share one session store and cannot run against the

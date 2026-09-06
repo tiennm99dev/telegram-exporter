@@ -162,10 +162,29 @@ func usage() {
 
 Commands:
   sync      Archive a chat to a remote, fetching only what is missing
-  list      Print every media message in a chat as id<TAB>size<TAB>name
   verify    Report whether a chat is fully archived on a remote
+  list      Print every media message in a chat as id<TAB>size<TAB>name
   doctor    Check the Telegram session, the destination remote, and free space
+
+Exit codes:
+  0  complete            2  usage error          4  stalled: nothing left is fetchable
+  1  files remain        3  remote or Telegram failure
+  130/143  interrupted
+
+Only 1 is worth retrying; a driver looping until 0 should stop on anything else.
 
 Run 'tgexport <command> -h' for command options.
 `)
+}
+
+// commandUsage gives a subcommand a header its flag list can hang off.
+//
+// The flag package's default is "Usage of sync:" and a bare list, which says
+// neither what the command does nor which options are required.
+func commandUsage(fs *flag.FlagSet, line, summary string) {
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintf(out, "Usage: %s\n\n%s\n\nOptions:\n", line, summary)
+		fs.PrintDefaults()
+	}
 }

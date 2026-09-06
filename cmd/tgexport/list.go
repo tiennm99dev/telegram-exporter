@@ -28,10 +28,13 @@ import (
 func listCmd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	var (
-		chat    = fs.String("c", "", "chat id, username, or t.me link (required)")
-		ns      = fs.String("n", "default", "tdl session namespace")
-		dataDir = fs.String("storage", tdlkv.DefaultDir(), "tdl bolt storage directory")
+		chat    = fs.String("c", "", "`CHAT`: id, username, or t.me link (required)")
+		ns      = fs.String("n", "default", "tdl session `NAMESPACE`")
+		dataDir = fs.String("storage", tdlkv.DefaultDir(), "`DIR` holding the tdl session store")
 	)
+
+	commandUsage(fs, "tgexport list -c CHAT [options]",
+		"Print every media message in a chat as id<TAB>size<TAB>name.")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return err

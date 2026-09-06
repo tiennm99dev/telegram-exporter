@@ -27,10 +27,13 @@ import (
 func doctorCmd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	var (
-		remoteArg = fs.String("r", "", "rclone destination to check, e.g. pikpak:archive")
-		ns        = fs.String("n", "default", "tdl session namespace")
-		dataDir   = fs.String("storage", tdlkv.DefaultDir(), "tdl bolt storage directory")
+		remoteArg = fs.String("r", "", "rclone destination `REMOTE:PATH` to check, e.g. pikpak:archive")
+		ns        = fs.String("n", "default", "tdl session `NAMESPACE`")
+		dataDir   = fs.String("storage", tdlkv.DefaultDir(), "`DIR` holding the tdl session store")
 	)
+
+	commandUsage(fs, "tgexport doctor [-r REMOTE:PATH] [options]",
+		"Check the Telegram session and, when a remote is given, that it\nresolves and has free space. Run this before a long archive.")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return err // main maps this to a clean exit

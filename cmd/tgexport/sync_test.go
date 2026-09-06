@@ -112,28 +112,3 @@ func TestValidateBudgetRejectsCapBelowLargestFile(t *testing.T) {
 		t.Errorf("an unset cap should accept anything, got: %v", err)
 	}
 }
-
-// Options the shell pipeline had must produce an explanation, not "flag
-// provided but not defined" — they are in wrapper scripts and muscle memory.
-func TestRetiredFlagsExplainWhatReplacedThem(t *testing.T) {
-	for name, replacement := range retiredFlags {
-		err := retiredFlag{name, replacement}.Set("x")
-		if err == nil {
-			t.Errorf("-%s was accepted, want an explanation", name)
-			continue
-		}
-		if !strings.Contains(err.Error(), "-"+name) {
-			t.Errorf("error for -%s should name the flag, got: %v", name, err)
-		}
-		if !strings.Contains(err.Error(), replacement) {
-			t.Errorf("error for -%s should say what replaced it, got: %v", name, err)
-		}
-	}
-
-	// The ones that mattered most in run.sh.
-	for _, name := range []string{"i", "a", "f", "p", "q"} {
-		if _, ok := retiredFlags[name]; !ok {
-			t.Errorf("-%s was a run.sh flag but is not recognised as retired", name)
-		}
-	}
-}

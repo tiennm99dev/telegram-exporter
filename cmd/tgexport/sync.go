@@ -21,41 +21,28 @@ import (
 	"github.com/tiennm99dev/telegram-exporter/internal/verify"
 )
 
-// retiredFlags map options the shell pipeline had onto what replaced them.
-//
-// Recognising them beats "flag provided but not defined": these were in
-// muscle memory and in wrapper scripts, and a bare parse error does not say
-// whether the concept moved or disappeared.
-var retiredFlags = map[string]string{
-	"i": "the rclone sweep interval is gone; uploads start the moment a download finishes",
-	"a": "--min-age is gone; a file is only uploaded once the downloader reports it complete",
-	"f": "the export JSON is gone; the chat is read live, so names cannot go stale",
-	"p": "there are no passes; one invocation converges, and re-running resumes",
-	"q": "renamed to --min-free",
-}
-
 // syncCmd archives a chat to a remote: read the chat, skip what is already
 // there, download and upload the rest, then report on the result.
 func syncCmd(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("sync", flag.ContinueOnError)
 	var (
-		chat       = flags.String("c", "", "chat id, username, or t.me link (required)")
-		remoteArg  = flags.String("r", "", "rclone destination, e.g. pikpak:archive (required)")
-		staging    = flags.String("d", "./staging", "staging directory for files in flight")
-		maxStaging = flags.String("m", "", "cap staging at this size, e.g. 40G (default: no cap)")
+		chat       = flags.String("c", "", "`CHAT`: id, username, or t.me link (required)")
+		remoteArg  = flags.String("r", "", "rclone destination `REMOTE:PATH`, e.g. pikpak:archive (required)")
+		staging    = flags.String("d", "./staging", "staging `DIR` for files in flight")
+		maxStaging = flags.String("m", "", "cap staging at `SIZE`, e.g. 40G (default: no cap)")
 		threads    = flags.Int("threads", 4, "connections per file")
 		limit      = flags.Int("limit", 2, "files downloading at once")
 		uploads    = flags.Int("uploads", 2, "files uploading at once")
-		minFree    = flags.Int64("min-free", 5, "stop if the remote has fewer than this many GiB free")
+		minFree    = flags.Int64("min-free", 5, "stop when the remote has under this many `GiB` free")
 		limitItems = flags.Int("limit-items", 0, "stop after this many files (0 means no limit)")
 		confirm    = flags.Bool("confirm", true, "re-state each uploaded file to prove its size")
-		takeout    = flags.Bool("takeout", true, "use a takeout session, as `tdl dl --takeout` did")
-		ns         = flags.String("n", "default", "tdl session namespace")
-		dataDir    = flags.String("storage", tdlkv.DefaultDir(), "tdl bolt storage directory")
+		takeout    = flags.Bool("takeout", true, "use a takeout session for higher rate limits")
+		ns         = flags.String("n", "default", "tdl session `NAMESPACE`")
+		dataDir    = flags.String("storage", tdlkv.DefaultDir(), "`DIR` holding the tdl session store")
 	)
-	for name, replacement := range retiredFlags {
-		flags.Var(retiredFlag{name, replacement}, name, "retired")
-	}
+	commandUsage(flags, "tgexport sync -c CHAT -r REMOTE:PATH [options]",
+		"Archive a chat's media to a remote, fetching only what is missing.\n"+
+			"Re-running resumes: anything already on the remote is skipped.")
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -351,14 +338,6 @@ func checkFree(ctx context.Context, dst fs.Fs, minGiB int64) error {
 			"free space or lower --min-free", dst.String(), freeGiB, minGiB)
 	}
 	return nil
-}
-
-// retiredFlag reports a helpful error for an option that no longer exists.
-type retiredFlag struct{ name, replacement string }
-
-func (r retiredFlag) String() string { return "" }
-func (r retiredFlag) Set(string) error {
-	return fmt.Errorf("-%s no longer exists: %s", r.name, r.replacement)
 }
 
 // parseSize reads a binary size such as 40G, matching what run.sh -m accepted.
