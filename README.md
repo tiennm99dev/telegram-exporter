@@ -84,7 +84,7 @@ a chat.
 | `--threads` | 4 | connections per file |
 | `--limit` | 2 | files downloading at once |
 | `--uploads` | 2 | files uploading at once |
-| `--min-free` | 5 | stop if the remote has fewer than this many GiB free |
+| `--min-free` | 5 | stop if the remote has fewer than this many GiB free, checked before and during the run |
 | `--limit-items` | 0 | stop after N files; for smoke tests |
 | `--confirm` | true | re-state each uploaded file to prove its size |
 | `--takeout` | true | use a takeout session |
@@ -95,10 +95,14 @@ a chat.
 | Code | Meaning |
 |---|---|
 | 0 | complete |
-| 1 | ran, but files remain |
+| 1 | ran, but files remain — run again |
 | 2 | usage error |
-| 3 | remote or Telegram failure |
+| 3 | remote or Telegram failure, including a destination that stopped accepting uploads |
+| 4 | stalled: files remain, none of which can ever be fetched |
 | 130 / 143 | interrupted (SIGINT / SIGTERM) |
+
+Only 1 is worth retrying. A driver looping until 0 should stop on anything else:
+3 and 4 both mean the next pass would do exactly what this one did.
 
 ## How it works
 
@@ -110,6 +114,13 @@ off and a completed one downloads nothing.
 `FileName` is exactly what Telegram reports. One function derives that string,
 and the same string is used both to ask whether the file is already archived and
 to write it — so the two can never disagree.
+
+A name that cannot survive that round trip is refused rather than rewritten: too
+long for the filesystem once `.part` is appended, not a single path element, or
+containing a character rclone's path encoder rewrites (control bytes, `DEL`, and
+the encoder's own escape character). Those files are reported under
+`unarchivable` and never counted as present. Rewriting them is what the next
+paragraph is about.
 
 That last point is the reason this program exists. Its predecessor derived the
 name twice: `tdl chat export` wrote the raw name into a JSON, while `tdl dl`
@@ -130,7 +141,14 @@ cap that does not is refused at startup rather than discovered as a hang.
 **Integrity.** A download is written to `<name>.part` and renamed only once its
 size matches what Telegram reported, so a file without the suffix is always
 whole. Uploads are re-stated afterwards to prove they arrived at the right size,
-before the local copy is gone.
+before the local copy is gone, and an object that turns out short is deleted
+rather than left under a name a later run would trust.
+
+`verify` compares stored sizes against what Telegram reports, so a truncated
+object is outstanding rather than "present". This is stricter than the shell
+verifier, which matched on name and non-zero size — on the archive this was
+built for it found six objects that had been counted complete for months, one
+of them 221 MiB standing in for a 2 GiB video. Re-running repairs them.
 
 ## Replacing the shell pipeline
 
@@ -154,6 +172,10 @@ semaphore. Some hard-won details were worth keeping, and are:
 - **Zero-byte files count as missing** — rclone overwrites a size-mismatched
   destination, so re-running repairs them — while files under 1 KiB are reported
   but trusted, since some real media genuinely is that small.
+- **Indexing ignores `RCLONE_*` filters.** The transfer tunables above are
+  deliberately env-overridable; the listing is not. A stray `RCLONE_EXCLUDE` or
+  `RCLONE_MIN_SIZE` left over from another job would otherwise narrow the index
+  and re-download everything it hid.
 
 Flags that disappeared are recognised and explain what replaced them:
 
