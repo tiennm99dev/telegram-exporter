@@ -2,11 +2,18 @@
 #
 # Verify a tdl/rclone export is complete and every file is intact.
 #
-# Rebuilds the filename tdl produces for each media message in the export JSON
-# ({DialogID}_{MessageID}_{FileName}) and checks it exists on the remote or in
-# staging. Zero-byte files count as missing: rclone overwrites a size-mismatched
-# destination, so re-running repairs them. Files under 1 KiB are reported for
-# inspection but trusted, since some real media is genuinely that small.
+# Rebuilds the exact filename tdl produces for each media message in the export
+# JSON ({DialogID}_{MessageID}_{FileName}) and checks it exists on the remote or
+# in staging. The export is Telegram's own record of the name, so the match is
+# exact: a file stored under any other name is not the file the export asked
+# for and counts as absent, however close the name looks. Zero-byte files count
+# as missing too: rclone overwrites a size-mismatched destination, so re-running
+# repairs them. Files under 1 KiB are reported for inspection but trusted, since
+# some real media is genuinely that small.
+#
+# A remote file whose id matches but whose name does not is a stale copy from an
+# earlier download; it is listed separately so it can be deleted, because the
+# re-download lands beside it rather than replacing it.
 #
 # Writes every id needing another attempt to missing-ids.txt.
 # Exit 0 = complete, 1 = incomplete, 2 = usage error.
@@ -37,7 +44,7 @@ sizes = {}
 for line in open(listing):
     m = re.match(r'^\s*(\d+)\s+\S+\s+\S+\s+(.*)$', line.rstrip('\n'))
     if m:
-        sizes[m.group(2)] = int(m.group(1))
+        sizes[os.path.basename(m.group(2))] = int(m.group(1))
 if os.path.isdir(staging):
     for f in os.listdir(staging):
         if not f.endswith('.tmp'):
@@ -54,11 +61,21 @@ if not dialog.isdigit():
 if not dialog:
     sys.exit('cannot determine dialog id')
 
-absent, empty, tiny = [], [], []
+# Names already stored for each message id, used only to tell an absent file
+# apart from one sitting there under the wrong name.
+stored = {}
+for name in sizes:
+    parts = name.split('_', 2)
+    if len(parts) == 3 and parts[0] == dialog and parts[1].isdigit():
+        stored.setdefault(int(parts[1]), []).append(name)
+
+absent, empty, tiny, misnamed = [], [], [], []
 for m in media:
     name = f"{dialog}_{m['id']}_{m['file']}"
     if name not in sizes:
         absent.append(m['id'])
+        for other in stored.get(m['id'], []):
+            misnamed.append((m['id'], name, other, sizes[other]))
     elif sizes[name] == 0:
         empty.append(m['id'])
     elif sizes[name] < 1024:
@@ -75,6 +92,14 @@ if tiny:
     print(f"  under 1KiB (check, not retried): {len(tiny)}")
     for i, s, n in tiny[:5]:
         print(f"      id {i}  {s} B  {n}")
+if misnamed:
+    print(f"\nstored under a different name : {len(misnamed)}")
+    print("  counted as absent and fetched again; delete the stale copies so the")
+    print("  re-download does not leave two files for the same message:")
+    for i, want, got, size in misnamed:
+        print(f"      id {i}  {size} B")
+        print(f"        export: {want}")
+        print(f"        remote: {got}")
 
 if todo:
     with open('missing-ids.txt', 'w') as fh:
