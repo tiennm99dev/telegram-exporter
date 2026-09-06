@@ -11,6 +11,7 @@ import (
 	"github.com/iyear/tdl/core/dcpool"
 	tdlstorage "github.com/iyear/tdl/core/storage"
 
+	"github.com/tiennm99dev/telegram-exporter/internal/report"
 	"github.com/tiennm99dev/telegram-exporter/internal/tdlkv"
 	"github.com/tiennm99dev/telegram-exporter/internal/tgsource"
 )
@@ -66,9 +67,10 @@ func listCmd(ctx context.Context, args []string) error {
 		// swallowed by a deferred call nobody checks.
 		out := bufio.NewWriter(os.Stdout)
 
+		scan := report.NewTicker(os.Stderr, "messages read")
 		count := 0
 		var total int64
-		for it, err := range tgsource.Walk(ctx, api, peer) {
+		for it, err := range tgsource.Walk(ctx, api, peer, scan.Update) {
 			if err != nil {
 				return err
 			}

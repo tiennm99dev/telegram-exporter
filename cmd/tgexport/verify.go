@@ -15,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 
 	"github.com/tiennm99dev/telegram-exporter/internal/remote"
+	"github.com/tiennm99dev/telegram-exporter/internal/report"
 	"github.com/tiennm99dev/telegram-exporter/internal/tdlkv"
 	"github.com/tiennm99dev/telegram-exporter/internal/tgsource"
 	"github.com/tiennm99dev/telegram-exporter/internal/verify"
@@ -66,7 +67,7 @@ func verifyCmd(ctx context.Context, args []string) error {
 	}
 
 	var (
-		report verify.Report
+		result verify.Report
 		idx    *remote.Index
 	)
 	if err := sess.Run(ctx, func(ctx context.Context, pool dcpool.Pool) error {
@@ -80,19 +81,30 @@ func verifyCmd(ctx context.Context, args []string) error {
 		// The chat is walked first and the remote listed second, so the snapshot
 		// is never older than the wanted set. The reverse order could report a
 		// file absent that was uploaded while the walk was still running.
+		fmt.Fprintf(os.Stderr, "reading %s\n", *chat)
+		scan := report.NewTicker(os.Stderr, "messages read")
+		var scanned int
 		var items []tgsource.Item
-		for it, err := range tgsource.Walk(ctx, api, peer) {
+		for it, err := range tgsource.Walk(ctx, api, peer, func(n int) { scanned = n; scan.Update(n) }) {
 			if err != nil {
 				return err
 			}
 			items = append(items, it)
 		}
 
-		idx, err = remote.BuildIndex(ctx, dst, peer.ID())
+		scan.Done(scanned)
+
+		fmt.Fprintf(os.Stderr, "indexing %s\n", dst.String())
+		idxTick := report.NewTicker(os.Stderr, "objects listed")
+		var listed int
+		idx, err = remote.BuildIndex(ctx, dst, peer.ID(), func(n int) {
+			listed = n
+			idxTick.Update(n)
+		})
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "indexed %d objects on %s\n", idx.Len(), dst.String())
+		idxTick.Done(listed)
 		if dup := idx.Collisions(); len(dup) > 0 {
 			// An ambiguous snapshot makes every verdict about these names
 			// unreliable, so it is reported rather than silently resolved.
@@ -104,26 +116,26 @@ func verifyCmd(ctx context.Context, args []string) error {
 		}
 		fmt.Fprintln(os.Stderr)
 
-		report = verify.Check(items, idx)
+		result = verify.Check(items, idx)
 		return nil
 	}); err != nil {
 		return err
 	}
 
 	out := bufio.NewWriter(os.Stdout)
-	report.Write(out)
+	result.Write(out)
 	if err := out.Flush(); err != nil {
 		return err
 	}
 
 	if *delStale {
-		if err := deleteMisnamed(ctx, dst, idx, report, *assumeYes); err != nil {
+		if err := deleteMisnamed(ctx, dst, idx, result, *assumeYes); err != nil {
 			return err
 		}
 	}
 
-	if !report.Complete() {
-		return fmt.Errorf("%w: %d file(s) still to fetch", errIncomplete, len(report.Todo()))
+	if !result.Complete() {
+		return fmt.Errorf("%w: %d file(s) still to fetch", errIncomplete, len(result.Todo()))
 	}
 	return nil
 }
@@ -138,9 +150,9 @@ func verifyCmd(ctx context.Context, args []string) error {
 // used elsewhere. Those differ the moment a remote has directory structure, and
 // deleting by basename would either miss the object or — worse, if the root
 // happens to hold a same-named file — delete the wrong one.
-func deleteMisnamed(ctx context.Context, dst rclonefs.Fs, idx *remote.Index, report verify.Report, assumeYes bool) error {
+func deleteMisnamed(ctx context.Context, dst rclonefs.Fs, idx *remote.Index, result verify.Report, assumeYes bool) error {
 	var targets []string
-	for _, m := range report.Misnamed {
+	for _, m := range result.Misnamed {
 		targets = append(targets, m.Found...)
 	}
 	if len(targets) == 0 {

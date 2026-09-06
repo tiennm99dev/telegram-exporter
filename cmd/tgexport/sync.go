@@ -122,15 +122,21 @@ func syncCmd(ctx context.Context, args []string) error {
 		}
 
 		fmt.Fprintf(os.Stderr, "reading %s\n", *chat)
+		scan := report.NewTicker(os.Stderr, "messages read")
 		var items []tgsource.Item
-		for it, err := range tgsource.Walk(ctx, api, peer) {
+		var scanned int
+		for it, err := range tgsource.Walk(ctx, api, peer, func(n int) {
+			scanned = n
+			scan.Update(n)
+		}) {
 			if err != nil {
 				return err
 			}
 			items = append(items, it)
 		}
+		scan.Done(scanned)
 
-		idx, err := remote.BuildIndex(ctx, dst, peer.ID())
+		idx, err := indexRemote(ctx, dst, peer.ID())
 		if err != nil {
 			return err
 		}
@@ -191,7 +197,7 @@ func syncCmd(ctx context.Context, args []string) error {
 
 		// The remote is re-indexed rather than assumed: the run's own view of
 		// what it uploaded is exactly the thing under test.
-		idx, err = remote.BuildIndex(ctx, dst, peer.ID())
+		idx, err = indexRemote(ctx, dst, peer.ID())
 		if err != nil {
 			return err
 		}
@@ -278,6 +284,22 @@ func validateBudget(budget int64, todo []tgsource.Item) error {
 			errUsage, float64(budget)/(1<<30), float64(largest)/(1<<30))
 	}
 	return nil
+}
+
+// indexRemote lists the destination, reporting progress as it goes.
+func indexRemote(ctx context.Context, dst fs.Fs, dialogID int64) (*remote.Index, error) {
+	fmt.Fprintf(os.Stderr, "indexing %s\n", dst.String())
+	tick := report.NewTicker(os.Stderr, "objects listed")
+	var seen int
+	idx, err := remote.BuildIndex(ctx, dst, dialogID, func(n int) {
+		seen = n
+		tick.Update(n)
+	})
+	if err != nil {
+		return nil, err
+	}
+	tick.Done(seen)
+	return idx, nil
 }
 
 // warnCollisions reports basenames the index found at more than one path.

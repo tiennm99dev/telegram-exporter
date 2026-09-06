@@ -33,7 +33,7 @@ func localIndex(t *testing.T, files map[string]int) *Index {
 	if err != nil {
 		t.Fatalf("open local fs: %v", err)
 	}
-	idx, err := BuildIndex(ctx, f, testDialog)
+	idx, err := BuildIndex(ctx, f, testDialog, nil)
 	if err != nil {
 		t.Fatalf("BuildIndex: %v", err)
 	}

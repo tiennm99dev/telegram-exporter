@@ -62,7 +62,9 @@ type Index struct {
 // why every field that can narrow a listing is set explicitly. A zero-value
 // Options is not a substitute either — it fails validation, because MinAge and
 // MaxAge both being 0 reads as "min > max".
-func BuildIndex(ctx context.Context, f fs.Fs, dialogID int64) (*Index, error) {
+// onCount, when non-nil, is called with the number of objects seen so far.
+// Listing a remote of any size takes minutes and says nothing while it runs.
+func BuildIndex(ctx context.Context, f fs.Fs, dialogID int64, onCount func(n int)) (*Index, error) {
 	ctx, ci := fs.AddConfig(ctx)
 	ci.MaxDepth = -1
 
@@ -88,7 +90,12 @@ func BuildIndex(ctx context.Context, f fs.Fs, dialogID int64) (*Index, error) {
 	}
 
 	// ListFn is documented not to call fn concurrently, so the maps need no lock.
+	seen := 0
 	if err := operations.ListFn(ctx, f, func(o fs.Object) {
+		seen++
+		if onCount != nil {
+			onCount(seen)
+		}
 		name := path.Base(o.Remote())
 
 		if _, seen := idx.byName[name]; seen {

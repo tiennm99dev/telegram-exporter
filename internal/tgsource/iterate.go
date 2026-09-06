@@ -47,12 +47,24 @@ func (i Item) Size() int64 { return i.Media.Size }
 // the export JSON encoded as an empty "file" field. On error the sequence yields
 // a zero Item with that error and stops; cancelling ctx stops it too, so an
 // interrupted run does not keep paging.
-func Walk(ctx context.Context, api *tg.Client, peer peers.Peer) iter.Seq2[Item, error] {
+// onScan, when non-nil, is called with the number of messages read so far. It
+// has to live here rather than in the caller's loop because most of a chat is
+// not media: text-only and service messages are filtered out below, so a caller
+// counting yielded items sees nothing at all while the walk crosses a long
+// stretch of conversation, and a working run is indistinguishable from a hung
+// one.
+func Walk(ctx context.Context, api *tg.Client, peer peers.Peer, onScan func(scanned int)) iter.Seq2[Item, error] {
 	return func(yield func(Item, error) bool) {
 		dialogID := peer.ID()
 
 		it := query.NewQuery(api).Messages().GetHistory(peer.InputPeer()).BatchSize(100).Iter()
+		scanned := 0
 		for it.Next(ctx) {
+			scanned++
+			if onScan != nil {
+				onScan(scanned)
+			}
+
 			msg, ok := it.Value().Msg.(*tg.Message)
 			if !ok {
 				continue // service messages have no media

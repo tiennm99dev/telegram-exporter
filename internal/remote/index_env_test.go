@@ -52,7 +52,7 @@ func indexChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idx, err := BuildIndex(t.Context(), f, 1234567890)
+	idx, err := BuildIndex(t.Context(), f, 1234567890, nil)
 	if err != nil {
 		t.Fatalf("BuildIndex: %v", err)
 	}
