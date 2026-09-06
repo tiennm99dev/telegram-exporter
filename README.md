@@ -78,8 +78,8 @@ indexing PikPak root 'mychannel'
 
   ↓ total    26/606 files [=>             ] 617.5 MiB / 79.0 GiB  2.5 MiB/s  8h47m
   ↑ total    24/606 files [=>             ] 598.0 MiB / 79.0 GiB  2.4 MiB/s  8h58m
-  ↓ …3214_4242_1000000000000000001.mp4   [=======>       ]  41.2 MiB / 96.0 MiB  1.8 MiB/s
-  ↑ …3214_4243_1000000000000000002.mp4   ⠹                         uploading 1.9 GiB
+  ↓ …7890_4242_1000000000000000001.mp4   [=======>       ]  41.2 MiB / 96.0 MiB  1.8 MiB/s
+  ↑ …7890_4243_1000000000000000002.mp4   ⠹                         uploading 1.9 GiB
 ```
 
 The two legs are counted separately because they run at different speeds and
