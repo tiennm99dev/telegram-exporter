@@ -61,6 +61,8 @@ func run() int {
 	switch os.Args[1] {
 	case "doctor":
 		err = doctorCmd(ctx, os.Args[2:])
+	case "list":
+		err = listCmd(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -147,6 +149,7 @@ func usage() {
 
 Commands:
   doctor    Check the Telegram session, the destination remote, and free space
+  list      Print every media message in a chat as id<TAB>size<TAB>name
 
 Run 'tgexport <command> -h' for command options.
 `)
