@@ -14,3 +14,7 @@ staging/
 
 # Session plans and reports.
 plans/
+
+# Go build output
+/tgexport
+/tgexport-slim
