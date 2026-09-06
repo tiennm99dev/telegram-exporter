@@ -26,10 +26,10 @@ var telegramHosts = []string{"t.me/", "telegram.me/", "telegram.dog/"}
 //
 // This is parsed rather than pattern-matched because the two HTTPS shapes overlap
 // in a way a regex gets wrong: a private link is t.me/c/<id>/<msg> and a public
-// one is t.me/<name>/<msg>, so "t.me/c/1234567890" — a perfectly good private
-// *channel* link — looks exactly like a public message link with the username
-// "c". The distinction is whether a trailing numeric component follows the chat,
-// and where that component sits depends on the "c" marker.
+// one is t.me/<name>/<msg>, so "t.me/c/1234567890" — a private channel link —
+// looks exactly like a public message link with the username "c". The
+// distinction is whether a trailing numeric component follows the chat, and
+// where that component sits depends on the leading marker.
 func isMessageLink(s string) bool {
 	lower := strings.ToLower(s)
 
@@ -51,27 +51,80 @@ func isMessageLink(s string) bool {
 	rest, _, _ = strings.Cut(rest, "#")
 
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(parts) >= 1 && parts[0] == "c" {
-		// c/<id> is the channel; c/<id>/<msg> is one message in it.
+	if len(parts) >= 1 && (parts[0] == "c" || parts[0] == "s") {
+		// Both put the chat in the second component, so a message is the third:
+		// c/<id>/<msg> and s/<name>/<msg>.
 		return len(parts) >= 3 && isDigits(parts[2])
 	}
-	// t.me/joinchat/<hash> and t.me/s/<name> are chats, not messages, and their
-	// second component is not a bare number — except for a hypothetical all-digit
-	// invite hash, which is not worth mis-parsing every real link to guard.
-	if len(parts) >= 1 && (parts[0] == "joinchat" || parts[0] == "s") {
+	// t.me/joinchat/<hash> is a chat, and its second component is not a bare
+	// number — except for a hypothetical all-digit invite hash, which is not
+	// worth mis-parsing every real link to guard.
+	if len(parts) >= 1 && parts[0] == "joinchat" {
 		return false
 	}
 	return len(parts) >= 2 && isDigits(parts[1])
 }
 
-// afterHost returns the path following a Telegram host, if s names one.
-func afterHost(lower string) (string, bool) {
-	for _, host := range telegramHosts {
-		if i := strings.Index(lower, host); i >= 0 {
-			return lower[i+len(host):], true
+// linkChat extracts the chat from a link whose first path component is a marker
+// rather than the chat itself.
+//
+// Without this the marker *is* the chat as far as the resolver is concerned.
+// gotd's deeplink parser takes the first path component as the domain and drops
+// the rest (deeplink.go:106-148), and ValidateDomain accepts a single letter, so
+// "t.me/s/mychannel" resolves the username "s" — either a hard-to-read
+// USERNAME_NOT_OCCUPIED, or, since one-character usernames exist, somebody
+// else's chat archived into the operator's remote.
+//
+// t.me/s/<name> is the preview page for a public channel, and the form most
+// likely to be copied out of a browser. t.me/c/<id> carries the bare MTProto
+// channel id — the same value a -100 Bot API id strips to.
+func linkChat(s string) (string, bool) {
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "tg://") {
+		return "", false
+	}
+	i, ok := hostEnd(lower)
+	if !ok {
+		return "", false
+	}
+	rest := s[i:]
+	rest, _, _ = strings.Cut(rest, "?")
+	rest, _, _ = strings.Cut(rest, "#")
+
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) < 2 || parts[1] == "" {
+		return "", false
+	}
+	switch strings.ToLower(parts[0]) {
+	case "c":
+		if isDigits(parts[1]) {
+			return parts[1], true
 		}
+	case "s":
+		return parts[1], true
 	}
 	return "", false
+}
+
+// afterHost returns the path following a Telegram host, if s names one.
+func afterHost(lower string) (string, bool) {
+	i, ok := hostEnd(lower)
+	if !ok {
+		return "", false
+	}
+	return lower[i:], true
+}
+
+// hostEnd returns the offset just past a Telegram host in an already-lowercased
+// string. Offsets rather than a substring, so a caller can slice the original
+// and keep the chat's real case.
+func hostEnd(lower string) (int, bool) {
+	for _, host := range telegramHosts {
+		if i := strings.Index(lower, host); i >= 0 {
+			return i + len(host), true
+		}
+	}
+	return 0, false
 }
 
 func isDigits(s string) bool {
@@ -103,6 +156,10 @@ func NormalizeChat(chat string) (string, error) {
 	if isMessageLink(chat) {
 		return "", fmt.Errorf("%q is a message link, not a chat — "+
 			"pass the chat's username or id instead", chat)
+	}
+
+	if c, ok := linkChat(chat); ok {
+		return c, nil
 	}
 
 	if m := botAPIID.FindStringSubmatch(chat); m != nil {

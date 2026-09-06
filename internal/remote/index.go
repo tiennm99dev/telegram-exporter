@@ -54,13 +54,31 @@ type Index struct {
 // a narrowed listing here does not fail — it silently reports archived files as
 // absent and re-downloads every one of them. The transfer tunables in Init are
 // deliberately env-overridable; this is not.
+//
+// Note that filter.NewFilter(nil) does NOT give a neutral filter: it copies the
+// package-level filter.Opt (filter.go:198-201), which rclone has already
+// populated from RCLONE_* at init via RegisterGlobalOptions. Passing nil here
+// reproduces exactly the inherited filter this is trying to escape, which is
+// why every field that can narrow a listing is set explicitly. A zero-value
+// Options is not a substitute either — it fails validation, because MinAge and
+// MaxAge both being 0 reads as "min > max".
 func BuildIndex(ctx context.Context, f fs.Fs, dialogID int64) (*Index, error) {
 	ctx, ci := fs.AddConfig(ctx)
 	ci.MaxDepth = -1
 
-	unfiltered, err := filter.NewFilter(nil)
+	unfiltered, err := filter.NewFilter(&filter.Options{
+		MinAge:  fs.DurationOff,
+		MaxAge:  fs.DurationOff,
+		MinSize: -1,
+		MaxSize: -1,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("build an empty filter: %w", err)
+	}
+	if !unfiltered.InActive() {
+		// Cheap and worth keeping: this is the assertion whose absence let a
+		// no-op neutralisation stand.
+		return nil, fmt.Errorf("internal: listing filter is not neutral")
 	}
 	ctx = filter.ReplaceConfig(ctx, unfiltered)
 
@@ -92,7 +110,13 @@ func BuildIndex(ctx context.Context, f fs.Fs, dialogID int64) (*Index, error) {
 		// A destination that does not exist yet holds nothing. That is an empty
 		// index, not a failure — it is what a first run against a new path looks
 		// like, and treating it as an error would make verify unusable there.
-		if errors.Is(err, fs.ErrorDirNotFound) {
+		//
+		// Only when nothing was listed, though. rclone's walk records a failed
+		// directory and keeps going (walk.go:168-183), returning the error at the
+		// end, so this same error also means "one subdirectory could not be
+		// listed" — and swallowing that would return a partial index as
+		// authoritative, reporting everything under it absent.
+		if errors.Is(err, fs.ErrorDirNotFound) && len(idx.byName) == 0 {
 			return idx, nil
 		}
 		return nil, fmt.Errorf("list %s: %w", f.String(), err)

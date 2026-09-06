@@ -133,7 +133,7 @@ func (s *Session) Run(ctx context.Context, fn func(context.Context, dcpool.Pool)
 			tclient.NewDefaultMiddlewares(ctx, s.timeout)...)
 		defer func() { _ = pool.Close() }()
 
-		return fn(ctx, pool)
+		return fn(ctx, withSafeTakeout(pool))
 	})
 
 	// gotd swallows cancellation: telegram.Client.Run ends with

@@ -5,11 +5,23 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/rclone/rclone/lib/encoder"
 )
 
-// maxNameBytes is NAME_MAX on Linux: the longest single path component ext4 and
-// friends accept. It is a byte count, not a rune count.
-const maxNameBytes = 255
+// maxNameBytes is the longest stored name that can actually be written.
+//
+// NAME_MAX on Linux is 255 bytes for a single path component, but the name is
+// not what lands on disk first: a download is written to name+".part" and
+// renamed afterwards, so the suffix has to fit inside the limit too. Checking
+// the bare 255 would pass a name whose part file then fails with ENAMETOOLONG —
+// after the item had already been queued, which stalls the walk on the same
+// message on every pass.
+const maxNameBytes = 255 - len(PartSuffix)
+
+// PartSuffix marks a download still in flight. It lives here because Safe's
+// length limit has to account for it.
+const PartSuffix = ".part"
 
 // Safe reports whether a stored name can be joined onto a directory path.
 //
@@ -48,6 +60,26 @@ func Safe(name string) error {
 		// Catches embedded separators, trailing slashes, and any ".." segment,
 		// since Base of all of those differs from the original.
 		return fmt.Errorf("filename is not a single path element: %q", name)
+	case encoder.OS.FromStandardName(name) != name:
+		// rclone does not address files by the bytes on disk. Every name given
+		// to an Fs is run through the backend's encoder, and every name listed
+		// back is re-encoded to the standard set — neither of which os.OpenFile
+		// performs. So a name containing one of the characters those encoders
+		// rewrite is written verbatim, then looked up under a different string:
+		// the upload fails with "object not found" forever, or it succeeds and
+		// the index records a name the presence check will never match.
+		//
+		// That is the original bug exactly — one name derived two ways — with
+		// rclone's encoder in the place filenamify used to occupy. Rejecting
+		// rather than encoding is the same choice made everywhere else here:
+		// encoding would give the two derivations a chance to disagree again.
+		return fmt.Errorf("filename is rewritten by rclone's path encoder: %q", name)
+	case encoder.Standard.Encode(encoder.Standard.Decode(name)) != name:
+		// The listing side of the same problem, and it is not backend-specific:
+		// the re-encode to the standard set happens above the backend encoder,
+		// so it applies to every remote. Control characters and DEL are the
+		// common case, and both are trivially settable in a Telegram filename.
+		return fmt.Errorf("filename is rewritten when rclone lists it back: %q", name)
 	}
 	return nil
 }

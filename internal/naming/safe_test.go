@@ -1,6 +1,8 @@
 package naming
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -120,13 +122,22 @@ func TestSplitStoredDoesNotMatchPrefixOverlap(t *testing.T) {
 // An over-long name is the one input that can hang a drive-until-complete loop:
 // os.Create rejects it, so the download fails forever while verify keeps
 // reporting it absent. It must be refused up front, not discovered per pass.
+//
+// The limit leaves room for the ".part" suffix, because that is what is opened
+// first. A name that fits in NAME_MAX but whose part file does not would pass
+// this check, be queued, and then fail to open every single pass.
 func TestSafeRejectsNamesOverTheFilesystemLimit(t *testing.T) {
 	prefix := "1234567890_42_"
-	fill := 255 - len(prefix)
+	fill := maxNameBytes - len(prefix)
 
 	atLimit := prefix + strings.Repeat("a", fill)
 	if err := Safe(atLimit); err != nil {
 		t.Errorf("Safe(%d bytes) = %v, want nil at exactly the limit", len(atLimit), err)
+	}
+	// The part file for a name at the limit must actually be creatable, which is
+	// the property the limit exists to guarantee.
+	if err := os.WriteFile(filepath.Join(t.TempDir(), atLimit+PartSuffix), nil, 0o600); err != nil {
+		t.Errorf("a name Safe accepted cannot be written as a part file: %v", err)
 	}
 
 	overLimit := prefix + strings.Repeat("a", fill+1)
@@ -134,7 +145,7 @@ func TestSafeRejectsNamesOverTheFilesystemLimit(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Safe(%d bytes) = nil, want an error past the limit", len(overLimit))
 	}
-	if !strings.Contains(err.Error(), "over the 255-byte limit") {
+	if !strings.Contains(err.Error(), fmt.Sprintf("over the %d-byte limit", maxNameBytes)) {
 		t.Errorf("error should name the limit, got: %v", err)
 	}
 
@@ -143,5 +154,47 @@ func TestSafeRejectsNamesOverTheFilesystemLimit(t *testing.T) {
 	if err := Safe(multibyte); err == nil {
 		t.Errorf("Safe(%d bytes, %d runes) = nil; the limit must count bytes",
 			len(multibyte), len([]rune(multibyte)))
+	}
+}
+
+// rclone addresses files by an encoded name, not by the bytes os.OpenFile
+// wrote. A name either encoder rewrites is the original two-derivations bug in
+// a new place: written verbatim, then looked up or listed under a different
+// string, so the file is re-fetched on every pass forever.
+//
+// These were confirmed against the real local backend before the check existed:
+// NewObject on a written "a‛b.jpg" reported "object not found", and a written
+// "a\nb.jpg" listed back as "a␊b.jpg".
+func TestSafeRejectsNamesRcloneRewrites(t *testing.T) {
+	rejected := map[string]string{
+		"the encoder's own escape character": "1234567890_42_a\u201bb.jpg",
+		"a symbol-for-control glyph":         "1234567890_42_a\u2421b.jpg",
+		"a raw newline":                      "1234567890_42_a\nb.jpg",
+		"a raw DEL":                          "1234567890_42_a\x7fb.jpg",
+		"a raw control byte":                 "1234567890_42_a\x01b.jpg",
+	}
+	for label, name := range rejected {
+		t.Run(label, func(t *testing.T) {
+			if err := Safe(name); err == nil {
+				t.Errorf("Safe(%q) = nil; rclone rewrites this name", name)
+			}
+		})
+	}
+
+	// Rejecting too much would be its own bug: these are ordinary Telegram
+	// filenames and every one must survive.
+	accepted := []string{
+		"1234567890_42_ünïcödé 12-08 🍓.mp4",
+		"1234567890_42_a#b%c!d[e]{f}.mp4",
+		"1234567890_42_ㅋㅋㅋ 😀.png",
+		"1234567890_42_a／b.jpg", // fullwidth solidus, not a separator
+		"1234567890_42_trailing. ",
+		"1234567890_42_'quoted' \"double\".mp4",
+		"1234567890_42_ünïcödé, spaces & commas.webm",
+	}
+	for _, name := range accepted {
+		if err := Safe(name); err != nil {
+			t.Errorf("Safe(%q) = %v, want nil for an ordinary filename", name, err)
+		}
 	}
 }

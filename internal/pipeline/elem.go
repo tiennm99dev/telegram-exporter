@@ -24,7 +24,11 @@ import (
 // because upload is triggered by a download returning rather than by a filter
 // over a directory. A distinct suffix just keeps a staging directory shared with
 // a legacy tdl run unambiguous during the cutover.
-const partSuffix = ".part"
+//
+// It is defined in naming because naming.Safe's length limit has to leave room
+// for it — a name that fits but whose part file does not would pass the check
+// and then fail to open, stalling the walk on that message forever.
+const partSuffix = naming.PartSuffix
 
 // elem adapts one media item to the downloader's element interface.
 type elem struct {

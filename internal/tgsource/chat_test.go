@@ -21,12 +21,17 @@ func TestNormalizeChat(t *testing.T) {
 		{"tg protocol link", "tg://resolve?domain=mychannel", "tg://resolve?domain=mychannel"},
 		{"bot api id loses the -100 prefix", "-1001234567890", "1234567890"},
 		{"surrounding whitespace is trimmed", "  mychannel\n", "mychannel"},
-		{"private channel link without a message", "https://t.me/c/1234567890", "https://t.me/c/1234567890"},
-		// Invite and preview links are chats; their second component is not a
-		// bare message number and must not be read as one.
+		// The "c" and "s" markers are not the chat. Passed through whole, gotd
+		// takes the first path component as the username and resolves "c" or
+		// "s" — a confusing failure at best, and somebody else's chat at worst,
+		// since one-character usernames exist.
+		{"private channel link yields the channel id", "https://t.me/c/1234567890", "1234567890"},
+		{"preview link yields the username", "https://t.me/s/mychannel", "mychannel"},
+		{"preview link keeps the username's case", "https://t.me/s/MyChannel", "MyChannel"},
+		// Invite links are chats; their second component is not a bare message
+		// number and must not be read as one.
 		{"invite link", "https://t.me/+AbCd_1234", "https://t.me/+AbCd_1234"},
 		{"joinchat link", "https://t.me/joinchat/AbCd1234", "https://t.me/joinchat/AbCd1234"},
-		{"preview link", "https://t.me/s/mychannel", "https://t.me/s/mychannel"},
 		{"other telegram host, no message", "https://telegram.dog/mychannel", "https://telegram.dog/mychannel"},
 		{"tg link without a post parameter", "tg://resolve?domain=mychannel", "tg://resolve?domain=mychannel"},
 	}
@@ -50,6 +55,7 @@ func TestNormalizeChatRejectsMessageLinks(t *testing.T) {
 	for _, in := range []string{
 		"https://t.me/c/1234567890/4242",
 		"t.me/c/1234567890/4242",
+		"https://t.me/s/mychannel/4242",
 		"https://t.me/mychannel/4242",
 		// gotd accepts all three Telegram hosts and its parser keeps only the
 		// domain, silently dropping the message number — so missing one of these
