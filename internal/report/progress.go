@@ -93,12 +93,16 @@ func humanBytes(n int64) string {
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
+	// The unit table runs to exabytes so the index cannot escape it. A PiB is
+	// not reachable from a Telegram chat, but a panic in the progress line would
+	// take down a run that was working.
+	const units = "KMGTPE"
 	div, exp := int64(unit), 0
-	for v := n / unit; v >= unit; v /= unit {
+	for v := n / unit; v >= unit && exp < len(units)-1; v /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), units[exp])
 }
 
 // isTerminal reports whether w is a character device.

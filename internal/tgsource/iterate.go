@@ -76,6 +76,16 @@ func Walk(ctx context.Context, api *tg.Client, peer peers.Peer) iter.Seq2[Item, 
 		if err := it.Err(); err != nil {
 			yield(Item{}, fmt.Errorf("walk chat history: %w", err))
 		}
+
+		// There is no cross-check that the walk saw the whole history, and the
+		// obvious one does not work. gotd's iterator ends with a nil error if a
+		// fetch yields an empty buffer (messages/iter.go:97,103,155-160), so a
+		// truncated walk is indistinguishable from a complete one — but
+		// Iterator.Total is the server's history count, which includes the
+		// deleted slots that Next skips at iter.go:159-162. Comparing the two
+		// reports a short read on any chat that has ever had a message deleted,
+		// which is nearly all of them. A real check would need a count of
+		// non-empty messages, which the API does not offer.
 	}
 }
 

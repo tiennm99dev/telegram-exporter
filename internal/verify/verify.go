@@ -63,6 +63,13 @@ type Tiny struct {
 	Size      int64
 }
 
+// Mismatch is a present file whose stored size is not the size Telegram reports.
+type Mismatch struct {
+	MessageID int
+	Name      string
+	Want, Got int64
+}
+
 // Report is the outcome of comparing a chat against a remote.
 type Report struct {
 	Expected int   // media messages in the chat
@@ -72,25 +79,71 @@ type Report struct {
 	Absent   []int // not on the remote under the wanted name
 	ZeroByte []int // present but empty
 
-	Misnamed []Misnamed
-	Unsafe   []Unsafe
-	Tiny     []Tiny
+	Misnamed   []Misnamed
+	Unsafe     []Unsafe
+	Tiny       []Tiny
+	Mismatched []Mismatch
+
+	// checked records that Check actually ran. Without it a zero Report claims
+	// the archive is complete — nothing expected, nothing missing — which is the
+	// value a command holds before its Telegram callback has populated it. Any
+	// path that returns early therefore reports success on an untouched chat.
+	checked bool
 }
+
+// Ran reports whether this came from a Check rather than being a zero value.
+func (r Report) Ran() bool { return r.checked }
 
 // Todo lists the message ids needing another fetch, in ascending order.
 //
-// Zero-byte files are included: rclone overwrites a size-mismatched destination,
-// so simply fetching again repairs them.
+// Zero-byte and wrong-size files are included: rclone overwrites a
+// size-mismatched destination, so simply fetching again repairs them.
 func (r Report) Todo() []int {
-	todo := make([]int, 0, len(r.Absent)+len(r.ZeroByte))
+	todo := make([]int, 0, len(r.Absent)+len(r.ZeroByte)+len(r.Mismatched))
 	todo = append(todo, r.Absent...)
 	todo = append(todo, r.ZeroByte...)
+	for _, m := range r.Mismatched {
+		todo = append(todo, m.MessageID)
+	}
 	sort.Ints(todo)
 	return todo
 }
 
+// Fetchable lists the outstanding ids a run could actually retrieve.
+//
+// It is Todo minus the unsafe names, which are in Todo because they are not
+// archived and out of this because no run will ever archive them. The gap
+// between the two is what tells "keep going" apart from "this is as far as it
+// goes".
+func (r Report) Fetchable() []int {
+	if len(r.Unsafe) == 0 {
+		return r.Todo()
+	}
+	blocked := make(map[int]struct{}, len(r.Unsafe))
+	for _, u := range r.Unsafe {
+		blocked[u.MessageID] = struct{}{}
+	}
+	todo := r.Todo()
+	out := todo[:0:0]
+	for _, id := range todo {
+		if _, skip := blocked[id]; !skip {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // Complete reports whether every expected file is present and non-empty.
-func (r Report) Complete() bool { return len(r.Todo()) == 0 }
+func (r Report) Complete() bool { return r.checked && len(r.Todo()) == 0 }
+
+// Stalled reports that work remains and none of it can ever be done.
+//
+// This is the state a drive-until-complete loop cannot detect for itself: the
+// report is identical on every pass, so a driver retrying on "incomplete" walks
+// the whole history and indexes the whole remote forever, achieving nothing.
+func (r Report) Stalled() bool {
+	return r.checked && len(r.Todo()) > 0 && len(r.Fetchable()) == 0
+}
 
 // Check compares the wanted items against an index of the remote.
 //
@@ -99,7 +152,7 @@ func (r Report) Complete() bool { return len(r.Todo()) == 0 }
 // and the near-misses are collected into Misnamed rather than being quietly
 // accepted, because the re-download lands beside them and both copies stay.
 func Check(items []tgsource.Item, idx Index) Report {
-	r := Report{Expected: len(items)}
+	r := Report{Expected: len(items), checked: true}
 
 	for _, it := range items {
 		r.Bytes += it.Size()
@@ -123,6 +176,16 @@ func Check(items []tgsource.Item, idx Index) Report {
 			}
 		case size == 0:
 			r.ZeroByte = append(r.ZeroByte, it.MessageID)
+		case size != it.Size():
+			// The remaining way a report could say "complete" when it is not.
+			// An upload that died partway leaves a plausible object under the
+			// right name, and matching on name and non-zero size alone would
+			// count it archived permanently. Telegram's size is known here, so
+			// there is no reason not to use it; rclone overwrites a mismatched
+			// destination, so fetching again repairs it.
+			r.Mismatched = append(r.Mismatched, Mismatch{
+				MessageID: it.MessageID, Name: it.Name, Want: it.Size(), Got: size,
+			})
 		default:
 			r.Present++
 			if size < tinyThreshold {
@@ -140,6 +203,13 @@ func (r Report) Write(w io.Writer) {
 	fmt.Fprintf(w, "present and intact : %d\n", r.Present)
 	fmt.Fprintf(w, "  absent           : %d\n", len(r.Absent))
 	fmt.Fprintf(w, "  zero-byte        : %d\n", len(r.ZeroByte))
+	if len(r.Mismatched) > 0 {
+		fmt.Fprintf(w, "  wrong size       : %d\n", len(r.Mismatched))
+		for _, m := range r.Mismatched[:min(5, len(r.Mismatched))] {
+			fmt.Fprintf(w, "      id %d  %d B on the remote, expected %d  %q\n",
+				m.MessageID, m.Got, m.Want, m.Name)
+		}
+	}
 
 	if len(r.Tiny) > 0 {
 		fmt.Fprintf(w, "  under 1KiB (check, not retried): %d\n", len(r.Tiny))
@@ -149,8 +219,8 @@ func (r Report) Write(w io.Writer) {
 	}
 
 	if len(r.Unsafe) > 0 {
-		fmt.Fprintf(w, "\nunsafe filenames   : %d\n", len(r.Unsafe))
-		fmt.Fprintf(w, "  these cannot be written to a path and are never fetched:\n")
+		fmt.Fprintf(w, "\nunarchivable       : %d\n", len(r.Unsafe))
+		fmt.Fprintf(w, "  these names cannot be written and will never be fetched:\n")
 		for _, u := range r.Unsafe {
 			fmt.Fprintf(w, "      id %d  %v\n", u.MessageID, u.Reason)
 		}
@@ -168,9 +238,15 @@ func (r Report) Write(w io.Writer) {
 		}
 	}
 
-	if todo := r.Todo(); len(todo) > 0 {
+	todo := r.Todo()
+	switch {
+	case r.Stalled():
+		fmt.Fprintf(w, "\nSTALLED: %d file(s) remain, none of which can be fetched.\n", len(todo))
+	case len(todo) > 0:
 		fmt.Fprintf(w, "\nneeds another pass : %d  (ids %d–%d)\n", len(todo), todo[0], todo[len(todo)-1])
-		return
+	case !r.checked:
+		fmt.Fprintf(w, "\nno chat was checked.\n")
+	default:
+		fmt.Fprintf(w, "\nCOMPLETE: every media message is present and non-empty.\n")
 	}
-	fmt.Fprintf(w, "\nCOMPLETE: every media message is present and non-empty.\n")
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"syscall"
 	"testing"
+
+	"github.com/tiennm99dev/telegram-exporter/internal/pipeline"
 	"time"
 )
 
@@ -27,6 +29,13 @@ func TestExitCode(t *testing.T) {
 		{"wrapped help", fmt.Errorf("parse: %w", flag.ErrHelp), nil, exitOK},
 		{"usage mistake", fmt.Errorf("%w: bad flag", errUsage), nil, exitUsage},
 		{"run left work outstanding", fmt.Errorf("%w: 12 files", errIncomplete), nil, exitIncomplete},
+		// Distinct from incomplete on purpose: a driver retrying on 1 would
+		// walk the whole chat forever for work that can never be done.
+		{"nothing left that can be fetched", fmt.Errorf("%w: 2 files", errStalled), nil, exitStalled},
+		// And a destination that stopped accepting uploads is a failure, not a
+		// retry: the next pass would be refused identically.
+		{"destination refusing uploads",
+			fmt.Errorf("run: %w", pipeline.ErrDestinationFailing), nil, exitRemoteError},
 		{"remote failure", errors.New("pikpak unreachable"), nil, exitRemoteError},
 		{"cancelled without a signal", context.Canceled, nil, exitSIGINT},
 		{"wrapped cancellation", fmt.Errorf("download: %w", context.Canceled), nil, exitSIGINT},

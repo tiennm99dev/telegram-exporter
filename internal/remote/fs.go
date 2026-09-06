@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -33,7 +34,13 @@ func DefaultTunables() Tunables {
 // installOnce guards configfile.Install, which swaps unsynchronised package
 // globals in rclone's config package. Calling it twice is harmless on its own,
 // but racing it against an Fs resolution is not.
-var installOnce sync.Once
+var (
+	installOnce sync.Once
+	// installErr is remembered, not just returned once. A second Init would
+	// otherwise skip the Do body and report success against a config that was
+	// never loaded.
+	installErr error
+)
 
 // Init loads the user's rclone.conf and applies tunables to a derived context.
 //
@@ -48,16 +55,21 @@ var installOnce sync.Once
 // code this tool defines as "incomplete", which would send a driver into an
 // endless retry. Loading up front turns that into an ordinary error.
 func Init(ctx context.Context, t Tunables) (context.Context, error) {
-	var err error
 	installOnce.Do(func() {
 		configfile.Install()
 		if lerr := config.Data().Load(); lerr != nil && !errors.Is(lerr, config.ErrorConfigFileNotFound) {
-			err = fmt.Errorf("cannot read rclone config %q: %w "+
+			installErr = fmt.Errorf("cannot read rclone config %q: %w "+
 				"(an encrypted config needs RCLONE_CONFIG_PASS)", config.GetConfigPath(), lerr)
+			return
 		}
+		// Marks the data loaded so rclone's own lazy path is never taken. That
+		// path ends in fs.Fatalf -> os.Exit(1), past every defer and with an
+		// exit code this tool defines as "incomplete"; loading here and not
+		// flagging it would leave the window open until the first NewFs.
+		config.LoadedData()
 	})
-	if err != nil {
-		return ctx, err
+	if installErr != nil {
+		return ctx, installErr
 	}
 
 	ctx, ci := fs.AddConfig(ctx)
@@ -93,9 +105,41 @@ func Resolve(ctx context.Context, remote string) (fs.Fs, error) {
 			return nil, fmt.Errorf("rclone remote %q is not configured; configured remotes: %s",
 				remote, strings.Join(sections(), ", "))
 		}
+		if missing := missingBackend(err); missing != "" {
+			// Otherwise this reads as a credentials problem, which sends the
+			// operator to rclone config for a fault that is in the build.
+			return nil, fmt.Errorf("remote %q needs the %q backend, which this binary does "+
+				"not contain — it registers only %s. A build without -tags slim includes "+
+				"every rclone backend: %w", remote, missing, strings.Join(backends(), ", "), err)
+		}
 		return nil, fmt.Errorf("cannot reach %q — check credentials and connectivity: %w", remote, err)
 	}
 	return f, nil
+}
+
+// missingBackend names the backend rclone could not find, if that is what went
+// wrong. fs.Find returns a bare fmt.Errorf with no sentinel to match, so the
+// text is all there is to go on.
+func missingBackend(err error) string {
+	const prefix = "didn't find backend called "
+	msg := err.Error()
+	i := strings.Index(msg, prefix)
+	if i < 0 {
+		return ""
+	}
+	name := strings.TrimPrefix(msg[i+len(prefix):], "\"")
+	name, _, _ = strings.Cut(name, "\"")
+	return name
+}
+
+// backends lists the backends compiled into this binary.
+func backends() []string {
+	out := make([]string, 0, len(fs.Registry))
+	for _, info := range fs.Registry {
+		out = append(out, info.Name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // EnsureDir creates the destination if it is not there yet.

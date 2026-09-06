@@ -7,7 +7,6 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -239,8 +238,10 @@ func TestRunStopsDownloadingAfterConsecutiveUploadFailures(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run returned nil, want the breaker's error")
 	}
-	if !strings.Contains(err.Error(), "consecutive upload failures") {
-		t.Errorf("error does not mention the breaker: %v", err)
+	// The sentinel, not the wording: the caller maps this to a distinct exit
+	// code so a driver stops instead of retrying against a dead remote.
+	if !errors.Is(err, ErrDestinationFailing) {
+		t.Errorf("error is not ErrDestinationFailing: %v", err)
 	}
 	// The point of stopping the iterator rather than cancelling uploads: the
 	// download side must not have walked the whole chat.

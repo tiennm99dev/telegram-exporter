@@ -36,6 +36,12 @@ type Options struct {
 	// Zero uses the shell pipeline's default of 5.
 	MaxFailures int
 
+	// FreeBytes and MinFree stop the run when the destination fills mid-way.
+	// Both must be set for the check to happen; a backend that cannot report a
+	// quota counts as unlimited.
+	FreeBytes func(context.Context) (int64, bool)
+	MinFree   int64
+
 	Report func(Stats)
 }
 
@@ -55,6 +61,14 @@ func (r Result) Failed() []Outcome {
 	}
 	return out
 }
+
+// ErrDestinationFailing marks a run stopped because the destination refused
+// upload after upload. It is distinct from an ordinary upload failure because
+// the right response differs: a transient error is worth retrying, while a
+// remote that is full, unreachable, or refusing credentials will refuse the next
+// pass identically, and a driver that retries walks the whole chat and downloads
+// gigabytes for nothing every time.
+var ErrDestinationFailing = errors.New("destination stopped accepting uploads")
 
 // maxRecordedErrors bounds what a run keeps from a failing remote. Past this,
 // the pattern is established and joining thousands of identical strings just
@@ -102,6 +116,7 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 	up := &uploader{local: local, dst: o.Dst, confirm: o.Confirm}
 
 	budget := newBudget(o.Budget)
+	guard := newSpaceGuard(o.FreeBytes, o.MinFree)
 	uploads := make(chan tgsource.Item, o.Uploads)
 
 	var (
@@ -126,7 +141,12 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 		go func() {
 			defer wg.Done()
 			for it := range uploads {
-				err := up.upload(ctx, it)
+				// A full destination is not worth another multi-gigabyte
+				// attempt, so the file is dropped rather than uploaded.
+				err := guard.check(ctx)
+				if err == nil {
+					err = up.upload(ctx, it)
+				}
 
 				if err != nil {
 					// MoveFile leaves the local copy in place when it fails, so
@@ -146,7 +166,9 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 					}
 					nErrs++
 					streak++
-					if streak >= o.MaxFailures && !tripped {
+					// A full remote trips immediately: unlike a transient
+					// error, waiting for a streak just wastes the downloads.
+					if (streak >= o.MaxFailures || errors.Is(err, ErrDestinationFailing)) && !tripped {
 						tripped = true
 						stopDownloads.Store(true)
 					}
@@ -195,8 +217,8 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 	var upErr error
 	switch {
 	case trip:
-		upErr = fmt.Errorf("stopped after %d consecutive upload failures (%d total): %w",
-			o.MaxFailures, total, joined)
+		upErr = fmt.Errorf("%w: stopped after %d upload failure(s): %w",
+			ErrDestinationFailing, total, joined)
 	case total > 0:
 		upErr = fmt.Errorf("%d upload(s) failed: %w", total, joined)
 	}

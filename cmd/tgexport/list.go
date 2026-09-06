@@ -19,8 +19,11 @@ import (
 //
 // It is the smallest thing that exercises the whole read path — resolve a chat,
 // walk its history, derive a name — so a naming or paging problem shows up here
-// rather than halfway through an archive run. The output is tab-separated on
-// purpose: filenames contain spaces, commas and quotes, but not tabs.
+// rather than halfway through an archive run. The output is tab-separated, and
+// the name is quoted: it comes from DocumentAttributeFilename, so whoever
+// uploaded the file chose it, and a raw tab would shift the columns while a raw
+// newline would split the record. Quoting also renders escape sequences inert
+// rather than letting them redraw the operator's terminal.
 func listCmd(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	var (
@@ -71,7 +74,7 @@ func listCmd(ctx context.Context, args []string) error {
 			}
 			count++
 			total += it.Size()
-			if _, err := fmt.Fprintf(out, "%d\t%d\t%s\n", it.MessageID, it.Size(), it.Name); err != nil {
+			if _, err := fmt.Fprintf(out, "%d\t%d\t%q\n", it.MessageID, it.Size(), it.Name); err != nil {
 				return err
 			}
 		}

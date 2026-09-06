@@ -30,6 +30,7 @@ const (
 	exitIncomplete  = 1
 	exitUsage       = 2
 	exitRemoteError = 3
+	exitStalled     = 4
 	exitSIGINT      = 130
 	exitSIGTERM     = 143
 )
@@ -40,6 +41,12 @@ var errUsage = errors.New("usage")
 
 // errIncomplete marks a run that finished cleanly but left work outstanding.
 var errIncomplete = errors.New("incomplete")
+
+// errStalled marks a run with work outstanding that no future run can do — every
+// remaining file has a name that cannot be written. It is distinct from
+// errIncomplete because a driver retrying on "incomplete" would otherwise walk
+// the whole history and re-index the whole remote forever, achieving nothing.
+var errStalled = errors.New("stalled")
 
 func main() {
 	os.Exit(run())
@@ -102,6 +109,8 @@ func exitCode(err error, sig os.Signal) int {
 		return exitSIGINT
 	case errors.Is(err, errUsage):
 		return exitUsage
+	case errors.Is(err, errStalled):
+		return exitStalled
 	case errors.Is(err, errIncomplete):
 		return exitIncomplete
 	default:

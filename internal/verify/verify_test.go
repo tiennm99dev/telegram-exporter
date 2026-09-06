@@ -157,8 +157,16 @@ func TestCheckFlagsUnsafeNames(t *testing.T) {
 
 	var sb strings.Builder
 	r.Write(&sb)
-	if !strings.Contains(sb.String(), "unsafe filenames") {
+	if !strings.Contains(sb.String(), "unarchivable") {
 		t.Errorf("report should flag the unsafe name, got:\n%s", sb.String())
+	}
+	// Nothing else is outstanding, so this run is as far as it can get. Saying
+	// "needs another pass" here is what makes a driver loop forever.
+	if !r.Stalled() {
+		t.Error("a report whose only outstanding item is unarchivable must be stalled")
+	}
+	if !strings.Contains(sb.String(), "STALLED") {
+		t.Errorf("report should say it is stalled, got:\n%s", sb.String())
 	}
 }
 
@@ -177,5 +185,58 @@ func TestReportTodoIsSorted(t *testing.T) {
 	r := Report{Absent: []int{4242, 3}, ZeroByte: []int{100}}
 	if want := []int{3, 100, 4242}; !slices.Equal(r.Todo(), want) {
 		t.Errorf("Todo() = %v, want %v", r.Todo(), want)
+	}
+}
+
+// A zero Report is the value a command holds before its Telegram callback has
+// run. It must not claim the archive is complete.
+func TestZeroReportIsNotComplete(t *testing.T) {
+	var r Report
+	if r.Complete() {
+		t.Error("a Report that never ran reports the archive complete")
+	}
+	if r.Ran() {
+		t.Error("Ran() is true on a zero Report")
+	}
+	if r.Stalled() {
+		t.Error("a Report that never ran reports itself stalled")
+	}
+
+	var sb strings.Builder
+	r.Write(&sb)
+	if strings.Contains(sb.String(), "COMPLETE") {
+		t.Errorf("a Report that never ran printed COMPLETE:\n%s", sb.String())
+	}
+}
+
+// A remote object under the right name but the wrong size is the last way a
+// report could say complete when it is not: an upload that died partway leaves
+// exactly that, and the local copy is already gone.
+func TestCheckTreatsAWrongSizeAsOutstanding(t *testing.T) {
+	items := []tgsource.Item{item(4242, "clip.mp4", 4096)}
+	idx := fakeIndex{"1234567890_4242_clip.mp4": 400}
+
+	r := Check(items, idx)
+	if r.Present != 0 {
+		t.Errorf("Present = %d, want 0 for a truncated object", r.Present)
+	}
+	if len(r.Mismatched) != 1 {
+		t.Fatalf("Mismatched = %v, want one entry", r.Mismatched)
+	}
+	if got := r.Mismatched[0]; got.Want != 4096 || got.Got != 400 {
+		t.Errorf("Mismatch = %+v, want want=4096 got=400", got)
+	}
+	if !slices.Contains(r.Todo(), 4242) {
+		t.Errorf("Todo = %v, want it to include 4242", r.Todo())
+	}
+	if r.Complete() {
+		t.Error("a truncated object was counted as a complete archive")
+	}
+	// It is fetchable, unlike an unsafe name — re-uploading overwrites it.
+	if !slices.Contains(r.Fetchable(), 4242) {
+		t.Errorf("Fetchable = %v, want it to include 4242", r.Fetchable())
+	}
+	if r.Stalled() {
+		t.Error("a repairable file must not be reported as stalled")
 	}
 }

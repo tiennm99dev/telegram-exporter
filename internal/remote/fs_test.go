@@ -3,6 +3,8 @@ package remote
 import (
 	"context"
 	"os"
+	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
@@ -92,18 +94,61 @@ func TestInitAppliesTunables(t *testing.T) {
 	}
 }
 
-// An operator's environment override must survive Init, so a tunable is only
-// applied when the corresponding variable is absent.
+// rclone reads RCLONE_TRANSFERS into its global config at package init, so an
+// in-process t.Setenv cannot observe whether Init honours it — the assertion
+// would pass with the guard removed. A subprocess is the only real check.
 func TestInitLeavesEnvOverridesAlone(t *testing.T) {
-	unset(t, "RCLONE_TRANSFERS")
-	t.Setenv("RCLONE_TRANSFERS", "7")
-
-	ctx, err := Init(context.Background(), Tunables{Transfers: 2, LowLevelRetries: 20})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
+	if os.Getenv("GO_INIT_ENV_CHILD") == "1" {
+		ctx, err := Init(t.Context(), Tunables{Transfers: 2, LowLevelRetries: 20})
+		if err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+		ci := fs.GetConfig(ctx)
+		if ci.Transfers != 7 {
+			t.Errorf("Transfers = %d, want the operator's 7", ci.Transfers)
+		}
+		if ci.LowLevelRetries != 99 {
+			t.Errorf("LowLevelRetries = %d, want the operator's 99", ci.LowLevelRetries)
+		}
+		return
 	}
-	if got := fs.GetConfig(ctx).Transfers; got == 2 {
-		t.Errorf("Transfers = 2; Init overwrote the RCLONE_TRANSFERS override")
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestInitLeavesEnvOverridesAlone", "-test.v")
+	cmd.Env = append(os.Environ(),
+		"GO_INIT_ENV_CHILD=1",
+		"RCLONE_TRANSFERS=7",
+		"RCLONE_LOW_LEVEL_RETRIES=99",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("Init overrode the operator's environment:\n%s", out)
+	}
+}
+
+// And with nothing set, the pikpak-derived tunables are what apply.
+func TestInitAppliesTunablesWhenTheEnvIsQuiet(t *testing.T) {
+	if os.Getenv("GO_INIT_QUIET_CHILD") == "1" {
+		ctx, err := Init(t.Context(), Tunables{Transfers: 2, LowLevelRetries: 20})
+		if err != nil {
+			t.Fatalf("Init: %v", err)
+		}
+		ci := fs.GetConfig(ctx)
+		if ci.Transfers != 2 || ci.LowLevelRetries != 20 {
+			t.Errorf("Transfers=%d LowLevelRetries=%d, want 2 and 20",
+				ci.Transfers, ci.LowLevelRetries)
+		}
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestInitAppliesTunablesWhenTheEnvIsQuiet", "-test.v")
+	cmd.Env = append(os.Environ(), "GO_INIT_QUIET_CHILD=1")
+	// Cleared rather than assumed absent: the parent's own environment may
+	// carry them, which would make this assert the opposite of what it says.
+	cmd.Env = slices.DeleteFunc(cmd.Env, func(kv string) bool {
+		return strings.HasPrefix(kv, "RCLONE_TRANSFERS=") ||
+			strings.HasPrefix(kv, "RCLONE_LOW_LEVEL_RETRIES=")
+	})
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("Init did not apply its tunables:\n%s", out)
 	}
 }
 

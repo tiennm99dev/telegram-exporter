@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"iter"
+	"math"
 	"os"
 
 	"github.com/iyear/tdl/core/dcpool"
@@ -108,7 +109,10 @@ func syncCmd(ctx context.Context, args []string) error {
 		return err
 	}
 
-	var final verify.Report
+	var (
+		final  verify.Report
+		runErr error
+	)
 	if err := sess.Run(ctx, func(ctx context.Context, pool dcpool.Pool) error {
 		api := pool.Default(ctx)
 
@@ -130,6 +134,7 @@ func syncCmd(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		warnCollisions(idx)
 		before := verify.Check(items, idx)
 		fmt.Fprintf(os.Stderr, "%d media messages, %d already archived, %d to fetch\n",
 			before.Expected, before.Present, len(before.Todo()))
@@ -151,7 +156,8 @@ func syncCmd(ctx context.Context, args []string) error {
 		fmt.Fprintf(os.Stderr, "fetching %d file(s), %.1f GiB\n", len(todo), float64(todoBytes)/(1<<30))
 
 		rep := report.New(os.Stderr, len(todo), todoBytes)
-		res, runErr := pipeline.Run(ctx, sliceSeq(todo), pipeline.Options{
+		var res pipeline.Result
+		res, runErr = pipeline.Run(ctx, sliceSeq(todo), pipeline.Options{
 			Pool:    pool,
 			Dst:     dst,
 			Staging: *staging,
@@ -162,6 +168,12 @@ func syncCmd(ctx context.Context, args []string) error {
 			Confirm: *confirm,
 			Takeout: *takeout,
 			Report:  rep.Update,
+			// Re-checked during the run, not only before it: an archive of this
+			// size runs for hours, and the destination can fill in the middle.
+			FreeBytes: func(ctx context.Context) (int64, bool) {
+				return remote.FreeBytes(ctx, dst)
+			},
+			MinFree: *minFree * (1 << 30),
 		})
 		rep.Finish(res.Stats)
 
@@ -173,6 +185,7 @@ func syncCmd(ctx context.Context, args []string) error {
 			// and hit one transient upload error has still made progress, and
 			// suppressing the report would leave the operator — and any driver
 			// reading the exit code — unable to tell that from a total failure.
+			// It is returned after the report, below, so the exit code is right.
 			fmt.Fprintf(os.Stderr, "run ended early: %v\n", runErr)
 		}
 
@@ -191,7 +204,17 @@ func syncCmd(ctx context.Context, args []string) error {
 	fmt.Fprintln(os.Stderr)
 	final.Write(os.Stdout)
 
-	if !final.Complete() {
+	switch {
+	case errors.Is(runErr, pipeline.ErrDestinationFailing):
+		// Exit 3, not 1. The destination refused upload after upload, and it
+		// will refuse them next pass too — a driver retrying on "incomplete"
+		// would walk 18k messages and re-download gigabytes into a remote that
+		// cannot take a byte, indefinitely.
+		return runErr
+	case final.Stalled():
+		return fmt.Errorf("%w: %d file(s) remain, none of which can be fetched",
+			errStalled, len(final.Todo()))
+	case !final.Complete():
 		return fmt.Errorf("%w: %d file(s) still to fetch", errIncomplete, len(final.Todo()))
 	}
 	return nil
@@ -257,6 +280,23 @@ func validateBudget(budget int64, todo []tgsource.Item) error {
 	return nil
 }
 
+// warnCollisions reports basenames the index found at more than one path.
+//
+// verify printed this and sync did not, which was backwards: an ambiguous
+// snapshot makes the presence verdict for those names unreliable, and sync is
+// the command that acts on the verdict by moving data.
+func warnCollisions(idx *remote.Index) {
+	dup := idx.Collisions()
+	if len(dup) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: %d basename(s) appear at more than one path; "+
+		"verdicts for them may flip between runs:\n", len(dup))
+	for _, name := range dup[:min(5, len(dup))] {
+		fmt.Fprintf(os.Stderr, "    %q\n", name)
+	}
+}
+
 // checkFree refuses to start when the remote is nearly full.
 //
 // A backend that cannot report a quota is treated as unlimited rather than as a
@@ -317,10 +357,19 @@ func parseSize(s string) (int64, error) {
 		if r < '0' || r > '9' {
 			return 0, fmt.Errorf("%q is not a size", s)
 		}
+		// Checked rather than allowed to wrap. A wrapped value is negative or
+		// zero, and both mean "no cap" downstream — so a typo would silently
+		// remove the staging limit instead of being refused.
+		if n > (math.MaxInt64-int64(r-'0'))/10 {
+			return 0, fmt.Errorf("%q is too large", s)
+		}
 		n = n*10 + int64(r-'0')
 	}
 	if n <= 0 {
 		return 0, fmt.Errorf("must be greater than zero")
+	}
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("%q is too large", s)
 	}
 	return n * mult, nil
 }
