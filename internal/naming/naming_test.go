@@ -87,3 +87,6 @@ func TestForKeepsCharactersTdlWouldRewrite(t *testing.T) {
 		}
 	}
 }
+
+// mediaNamed builds the only part of tmedia.Media these tests care about.
+func mediaNamed(name string) *tmedia.Media { return &tmedia.Media{Name: name} }

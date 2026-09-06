@@ -63,6 +63,8 @@ func run() int {
 		err = doctorCmd(ctx, os.Args[2:])
 	case "list":
 		err = listCmd(ctx, os.Args[2:])
+	case "verify":
+		err = verifyCmd(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -150,6 +152,7 @@ func usage() {
 Commands:
   doctor    Check the Telegram session, the destination remote, and free space
   list      Print every media message in a chat as id<TAB>size<TAB>name
+  verify    Report whether a chat is fully archived on a remote
 
 Run 'tgexport <command> -h' for command options.
 `)
