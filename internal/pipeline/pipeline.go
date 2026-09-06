@@ -61,6 +61,14 @@ func (r Result) Failed() []Outcome {
 // makes the final message unreadable.
 const maxRecordedErrors = 10
 
+// download is the download step, indirected so a test can drive Run's
+// composition without a live Telegram connection. What that buys is coverage of
+// the three properties Run alone is responsible for — that the upload channel is
+// closed only after every send, that the byte budget balances across a whole
+// run, and that a tripped breaker still terminates — none of which the pieces
+// can be tested for individually.
+var download = Download
+
 // Run downloads every item and uploads each one as it completes.
 //
 // This is the whole reason for the rewrite. run.sh could not see inside tdl, so
@@ -150,7 +158,7 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 		}()
 	}
 
-	dlOutcomes, stats, dlErr := Download(ctx, seq, DownloadOptions{
+	dlOutcomes, stats, dlErr := download(ctx, seq, DownloadOptions{
 		Pool:    o.Pool,
 		Staging: o.Staging,
 		Threads: o.Threads,
@@ -178,17 +186,21 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 	trip, total := tripped, nErrs
 	mu.Unlock()
 
-	res := Result{Stats: stats, Outcomes: dlOutcomes}
+	// Both halves are reported. On the most common failure path — Ctrl-C — the
+	// download side returns context.Canceled while the upload workers drain
+	// whatever is still queued, fail every one of them against the cancelled
+	// context, and delete the staged file each time. Returning only the download
+	// error would leave the operator with "context canceled" and no sign that
+	// finished files had been discarded.
+	var upErr error
 	switch {
-	case dlErr != nil:
-		return res, dlErr
 	case trip:
-		return res, fmt.Errorf("stopped after %d consecutive upload failures (%d total): %w",
+		upErr = fmt.Errorf("stopped after %d consecutive upload failures (%d total): %w",
 			o.MaxFailures, total, joined)
 	case total > 0:
-		return res, fmt.Errorf("%d upload(s) failed: %w", total, joined)
+		upErr = fmt.Errorf("%d upload(s) failed: %w", total, joined)
 	}
-	return res, nil
+	return Result{Stats: stats, Outcomes: dlOutcomes}, errors.Join(dlErr, upErr)
 }
 
 // budget bounds how many bytes of downloaded-but-not-yet-uploaded data sit on

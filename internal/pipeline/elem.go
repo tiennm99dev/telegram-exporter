@@ -87,6 +87,11 @@ type elemIter struct {
 	// another goroutine without racing on the iterator itself.
 	stopped *atomic.Bool
 
+	// skipped collects items refused before any download was attempted. They do
+	// not stop the run: one message with a hostile filename must not be able to
+	// strand every message behind it, which is what ending iteration would mean.
+	skipped []error
+
 	// opened records every file handle. finish closes each one on the normal
 	// path, so this is not what keeps descriptors from leaking; it is the
 	// backstop for items that were opened but never reached finish, which is
@@ -106,29 +111,41 @@ func newElemIter(seq iter.Seq2[tgsource.Item, error], staging string, takeout bo
 }
 
 func (i *elemIter) Next(ctx context.Context) bool {
-	if i.failure != nil || i.stopped.Load() {
-		return false
-	}
-	if err := ctx.Err(); err != nil {
-		i.failure = err
-		return false
-	}
+	var item tgsource.Item
+	for {
+		if i.failure != nil || i.stopped.Load() {
+			return false
+		}
+		if err := ctx.Err(); err != nil {
+			i.failure = err
+			return false
+		}
 
-	item, err, ok := i.next()
-	if !ok {
-		return false
-	}
-	if err != nil {
-		i.failure = err
-		return false
-	}
+		var (
+			err error
+			ok  bool
+		)
+		item, err, ok = i.next()
+		if !ok {
+			return false
+		}
+		if err != nil {
+			i.failure = err
+			return false
+		}
 
-	// A name that cannot be written is refused here rather than left to
-	// os.Create: the error names the message, and the run continues instead of
-	// failing on a path that could never have worked.
-	if err := naming.Safe(item.Name); err != nil {
-		i.failure = fmt.Errorf("message %d: %w", item.MessageID, err)
-		return false
+		// A name that cannot be written is refused here rather than left to
+		// os.Create, and refusing it skips the item rather than ending the walk.
+		// selectTodo already filters these out on the CLI path, so reaching this
+		// is either a second caller or a gap there; in both cases one unwritable
+		// name must not strand the rest of the chat behind it.
+		if err := naming.Safe(item.Name); err != nil {
+			if len(i.skipped) < maxRecordedErrors {
+				i.skipped = append(i.skipped, fmt.Errorf("message %d: %w", item.MessageID, err))
+			}
+			continue
+		}
+		break
 	}
 
 	if i.acquire != nil {

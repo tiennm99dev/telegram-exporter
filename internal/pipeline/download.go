@@ -103,7 +103,10 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 	if err == nil {
 		err = it.failure
 	}
-	return outcomes, stats, err
+	// Skipped items are reported alongside whatever else happened rather than
+	// instead of it: the run did real work, and the caller still needs to know
+	// these messages were never attempted.
+	return outcomes, stats, errors.Join(append([]error{err}, it.skipped...)...)
 }
 
 // finish closes a downloaded file and either promotes it or removes it.
@@ -143,6 +146,13 @@ func finish(staging string, e *elem, downloadErr error) error {
 	}
 
 	if err := os.Rename(part, finalPath(staging, e.item)); err != nil {
+		// The part file goes too. The caller treats this as a failure and hands
+		// the byte reservation back, so leaving the file on disk would put the
+		// staging cap permanently over-committed by its size.
+		if rerr := os.Remove(part); rerr != nil && !os.IsNotExist(rerr) {
+			return errors.Join(fmt.Errorf("promote %q: %w", part, err),
+				fmt.Errorf("and it is still in staging: %w", rerr))
+		}
 		return fmt.Errorf("promote %q: %w", part, err)
 	}
 	return nil

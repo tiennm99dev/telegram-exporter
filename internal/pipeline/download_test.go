@@ -129,9 +129,47 @@ func TestSweepPartialsOnMissingDirectory(t *testing.T) {
 	}
 }
 
-// An unwritable name must stop the iterator with a message naming the message,
-// rather than surfacing as a bare os.Create failure later.
-func TestElemIterRejectsUnsafeNames(t *testing.T) {
+// An unwritable name must be refused with a message naming the message, rather
+// than surfacing as a bare os.Create failure later — and it must be skipped, not
+// treated as the end of the walk. One hostile filename cannot be allowed to
+// strand every message behind it.
+func TestElemIterSkipsUnsafeNamesAndKeepsGoing(t *testing.T) {
+	staging := t.TempDir()
+	bad := testItem(t, 7, "../../escape.conf", 10)
+	good := testItem(t, 8, "fine.mp4", 10)
+
+	seq := func(yield func(tgsource.Item, error) bool) {
+		if !yield(bad, nil) {
+			return
+		}
+		yield(good, nil)
+	}
+	it := newElemIter(seq, staging, false)
+	defer func() { _ = it.Close() }()
+
+	if !it.Next(t.Context()) {
+		t.Fatal("an unsafe name ended the walk; the item after it was never reached")
+	}
+	if got := it.current.item.MessageID; got != 8 {
+		t.Fatalf("Next yielded message %d, want the item after the unsafe one", got)
+	}
+	if it.Next(t.Context()) {
+		t.Error("iterator produced a third item")
+	}
+	if it.failure != nil {
+		t.Errorf("a skipped item must not fail the run, got: %v", it.failure)
+	}
+	if len(it.skipped) != 1 {
+		t.Fatalf("skipped = %d, want 1", len(it.skipped))
+	}
+	if !strings.Contains(it.skipped[0].Error(), "message 7") {
+		t.Errorf("the skip should name the message, got: %v", it.skipped[0])
+	}
+}
+
+// The skipped items still have to reach the caller: the run did work, but these
+// messages were never attempted and nothing else would say so.
+func TestDownloadReportsSkippedItems(t *testing.T) {
 	staging := t.TempDir()
 	bad := testItem(t, 7, "../../escape.conf", 10)
 
@@ -139,14 +177,14 @@ func TestElemIterRejectsUnsafeNames(t *testing.T) {
 	it := newElemIter(seq, staging, false)
 	defer func() { _ = it.Close() }()
 
-	if it.Next(t.Context()) {
-		t.Fatal("iterator accepted a name that escapes the staging directory")
+	for it.Next(t.Context()) {
 	}
-	if it.failure == nil {
-		t.Fatal("no failure recorded after rejecting an unsafe name")
+	err := errors.Join(append([]error{nil}, it.skipped...)...)
+	if err == nil {
+		t.Fatal("skipped items produced no error for the caller")
 	}
-	if !strings.Contains(it.failure.Error(), "message 7") {
-		t.Errorf("failure should name the message, got: %v", it.failure)
+	if !strings.Contains(err.Error(), "message 7") {
+		t.Errorf("error should name the skipped message, got: %v", err)
 	}
 }
 
@@ -303,12 +341,6 @@ func TestElemIterNeverReportsErrToTheDownloader(t *testing.T) {
 		"walk error": func() *elemIter {
 			seq := func(yield func(tgsource.Item, error) bool) {
 				yield(tgsource.Item{}, errors.New("boom"))
-			}
-			return newElemIter(seq, staging, false)
-		},
-		"unsafe name": func() *elemIter {
-			seq := func(yield func(tgsource.Item, error) bool) {
-				yield(testItem(t, 1, "../escape", 10), nil)
 			}
 			return newElemIter(seq, staging, false)
 		},
