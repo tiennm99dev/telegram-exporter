@@ -42,7 +42,9 @@ type Options struct {
 	FreeBytes func(context.Context) (int64, bool)
 	MinFree   int64
 
-	Report func(Stats)
+	// Events, when set, receives the run's per-item lifecycle: which files are
+	// downloading, which are uploading, and how far along each one is.
+	Events Events
 }
 
 // Result is what a run achieved.
@@ -108,6 +110,9 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 	if o.MaxFailures <= 0 {
 		o.MaxFailures = 5
 	}
+	if o.Events == nil {
+		o.Events = nopEvents{}
+	}
 
 	local, err := fs.NewFs(ctx, o.Staging)
 	if err != nil {
@@ -145,7 +150,9 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 				// attempt, so the file is dropped rather than uploaded.
 				err := guard.check(ctx)
 				if err == nil {
+					o.Events.UploadStart(it)
 					err = up.upload(ctx, it)
+					o.Events.UploadDone(it, err)
 				}
 
 				if err != nil {
@@ -186,7 +193,7 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 		Threads: o.Threads,
 		Limit:   o.Limit,
 		Takeout: o.Takeout,
-		Report:  o.Report,
+		Events:  o.Events,
 		acquire: budget.acquire,
 		release: budget.release,
 		onReady: func(it tgsource.Item) { uploads <- it },

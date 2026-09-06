@@ -24,10 +24,10 @@ type DownloadOptions struct {
 	Limit   int  // files in flight
 	Takeout bool // use a takeout session, as `tdl dl --takeout` does
 
-	// Report, when set, is called with a running summary. It is invoked from
-	// download worker goroutines, so it must be cheap and safe to call
+	// Events, when set, receives the run's per-item lifecycle. It is invoked
+	// from download worker goroutines, so it must be cheap and safe to call
 	// concurrently.
-	Report func(Stats)
+	Events Events
 
 	// acquire reserves staging space before a download starts, blocking until
 	// there is room. Unset means no bound. release hands a reservation back for
@@ -87,7 +87,7 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 			o.onFailed(e.item)
 		}
 		return ferr
-	}, o.Report)
+	}, o.Events)
 
 	err := downloader.New(downloader.Options{
 		Pool:     o.Pool,

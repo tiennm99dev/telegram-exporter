@@ -36,14 +36,17 @@ type progress struct {
 	inFlight map[int]int64 // message id -> bytes written so far
 
 	finish func(*elem, error) error
-	report func(Stats)
+	events Events
 }
 
-func newProgress(finish func(*elem, error) error, report func(Stats)) *progress {
+func newProgress(finish func(*elem, error) error, events Events) *progress {
+	if events == nil {
+		events = nopEvents{}
+	}
 	return &progress{
 		inFlight: make(map[int]int64),
 		finish:   finish,
-		report:   report,
+		events:   events,
 	}
 }
 
@@ -54,7 +57,8 @@ func (p *progress) OnAdd(e downloader.Elem) {
 	p.stats.BytesTotal += el.item.Size()
 	stats := p.stats
 	p.mu.Unlock()
-	p.emit(stats)
+	p.events.DownloadStart(el.item)
+	p.events.Stats(stats)
 }
 
 func (p *progress) OnDownload(e downloader.Elem, state downloader.ProgressState) {
@@ -67,7 +71,8 @@ func (p *progress) OnDownload(e downloader.Elem, state downloader.ProgressState)
 	p.stats.BytesDone += state.Downloaded - prev
 	stats := p.stats
 	p.mu.Unlock()
-	p.emit(stats)
+	p.events.DownloadBytes(el.item, state.Downloaded)
+	p.events.Stats(stats)
 }
 
 func (p *progress) OnDone(e downloader.Elem, err error) {
@@ -89,13 +94,8 @@ func (p *progress) OnDone(e downloader.Elem, err error) {
 	p.outcomes = append(p.outcomes, Outcome{Item: el.item, Err: err})
 	stats := p.stats
 	p.mu.Unlock()
-	p.emit(stats)
-}
-
-func (p *progress) emit(s Stats) {
-	if p.report != nil {
-		p.report(s)
-	}
+	p.events.DownloadDone(el.item, err)
+	p.events.Stats(stats)
 }
 
 func (p *progress) results() ([]Outcome, Stats) {

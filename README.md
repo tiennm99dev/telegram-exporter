@@ -57,6 +57,33 @@ build unless the destination will never change.
 ./tgexport sync -c CHAT -r REMOTE:PATH [options]
 ```
 
+A run states what it found, what it is about to do, and then shows each file as
+it moves:
+
+```
+reading mychannel
+  12,000 messages read in 4m31s
+indexing PikPak root 'mychannel'
+  11,406 objects listed in 2m10s
+
+  chat holds     12,000 media, 250.0 GiB
+  archived       11,400
+    never fetched 600
+    wrong size    6
+
+  fetching       606 files, 79.0 GiB (largest 2.0 GiB)
+  into           PikPak root 'mychannel'
+  staging        ./staging, capped at 40.0 GiB
+  concurrency    2 download(s) x 4 thread(s), 2 upload(s)
+
+  total     26/606 files [=>              ] 617.5 MiB / 79.0 GiB  2.5 MiB/s  8h47m
+  ↓ …3214_4242_1000000000000000001.mp4   [=======>        ]  41.2 MiB / 96.0 MiB  1.8 MiB/s
+  ↑ …3214_4243_1000000000000000002.mp4   ⠹                          uploading 1.9 GiB
+```
+
+Redirected output gets the same information as plain periodic lines plus one
+line per archived file, with no cursor movement — a captured log stays readable.
+
 `CHAT` accepts a numeric id as printed by `tdl chat ls`, a username with or
 without `@`, or a `t.me`/`tg://` link. A Bot API `-100…` id is converted
 automatically. A link to a single *message* is refused — it names a message, not

@@ -142,8 +142,7 @@ func syncCmd(ctx context.Context, args []string) error {
 		}
 		warnCollisions(idx)
 		before := verify.Check(items, idx)
-		fmt.Fprintf(os.Stderr, "%d media messages, %d already archived, %d to fetch\n",
-			before.Expected, before.Present, len(before.Todo()))
+		report.Survey(os.Stderr, before)
 
 		todo := selectTodo(items, before, *limitItems)
 		if len(todo) == 0 {
@@ -155,13 +154,24 @@ func syncCmd(ctx context.Context, args []string) error {
 			return err
 		}
 
-		var todoBytes int64
+		var todoBytes, largest int64
 		for _, it := range todo {
 			todoBytes += it.Size()
+			largest = max(largest, it.Size())
 		}
-		fmt.Fprintf(os.Stderr, "fetching %d file(s), %.1f GiB\n", len(todo), float64(todoBytes)/(1<<30))
+		report.Plan(os.Stderr, report.PlanInfo{
+			Files:       len(todo),
+			Bytes:       todoBytes,
+			Largest:     largest,
+			Budget:      budget,
+			Staging:     *staging,
+			Threads:     *threads,
+			Downloads:   *limit,
+			Uploads:     *uploads,
+			Destination: dst.String(),
+		})
 
-		rep := report.New(os.Stderr, len(todo), todoBytes)
+		rep := report.Events(os.Stderr, len(todo), todoBytes)
 		var res pipeline.Result
 		res, runErr = pipeline.Run(ctx, sliceSeq(todo), pipeline.Options{
 			Pool:    pool,
@@ -173,7 +183,7 @@ func syncCmd(ctx context.Context, args []string) error {
 			Budget:  budget,
 			Confirm: *confirm,
 			Takeout: *takeout,
-			Report:  rep.Update,
+			Events:  rep,
 			// Re-checked during the run, not only before it: an archive of this
 			// size runs for hours, and the destination can fill in the middle.
 			FreeBytes: func(ctx context.Context) (int64, bool) {

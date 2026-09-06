@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tiennm99dev/telegram-exporter/internal/pipeline"
+	"github.com/tiennm99dev/telegram-exporter/internal/tgsource"
 )
 
 // statsInterval is how often a redirected run prints a line.
@@ -19,10 +20,14 @@ import (
 // else gets a periodic summary.
 const statsInterval = 30 * time.Second
 
-// Reporter renders progress, adapting to whether it is writing to a terminal.
+// Reporter renders progress as periodic plain-text lines.
+//
+// This is the redirected-output path. Bars are deliberately absent: they are
+// continuous ANSI cursor movement, and a captured log of them is megabytes of
+// control characters — which is exactly what tdl's progress bar did to the shell
+// pipeline's logs.
 type Reporter struct {
 	w          io.Writer
-	tty        bool
 	total      int
 	totalBytes int64
 
@@ -31,35 +36,40 @@ type Reporter struct {
 	lastLine time.Time
 }
 
-// New builds a reporter for w, which is treated as a terminal when it is one.
+// Events builds the renderer suited to w: bars on a terminal, periodic lines
+// anywhere else.
 //
 // The totals are passed in rather than taken from Stats because Stats.BytesTotal
 // only counts items the downloader has started, so a progress line built from it
 // shows a denominator that grows as the run proceeds — "0 B of 52 KiB" on a run
 // that will move gigabytes. The caller knows the real figures before starting.
-func New(w io.Writer, total int, totalBytes int64) *Reporter {
-	return &Reporter{w: w, tty: isTerminal(w), total: total, totalBytes: totalBytes, started: time.Now()}
+func Events(w io.Writer, total int, totalBytes int64) interface {
+	pipeline.Events
+	Finish(pipeline.Stats)
+} {
+	if isTerminal(w) {
+		return NewLive(w, total, totalBytes)
+	}
+	return newReporter(w, total, totalBytes)
 }
 
-// Update renders a snapshot. Safe to call from several goroutines.
+func newReporter(w io.Writer, total int, totalBytes int64) *Reporter {
+	return &Reporter{w: w, total: total, totalBytes: totalBytes, started: time.Now()}
+}
+
+// Stats renders a snapshot. Safe to call from several goroutines.
 //
 // A contended update is dropped rather than queued. Every download worker calls
 // this on each progress callback, so holding the lock across the write would
-// make terminal latency — an ssh session with a slow link, say — throttle the
-// downloads themselves. A skipped frame costs nothing; the next callback is
-// milliseconds away and Finish always prints.
-func (r *Reporter) Update(s pipeline.Stats) {
+// make write latency throttle the downloads themselves. A skipped frame costs
+// nothing; the next callback is milliseconds away and Finish always prints.
+func (r *Reporter) Stats(s pipeline.Stats) {
 	if !r.mu.TryLock() {
 		return
 	}
 	defer r.mu.Unlock()
 
 	now := time.Now()
-	if r.tty {
-		// \r rather than \n: one line, redrawn.
-		fmt.Fprintf(r.w, "\r\033[K%s", r.line(s, now))
-		return
-	}
 	if now.Sub(r.lastLine) < statsInterval {
 		return
 	}
@@ -67,25 +77,49 @@ func (r *Reporter) Update(s pipeline.Stats) {
 	fmt.Fprintf(r.w, "%s\n", r.line(s, now))
 }
 
-// Finish writes the closing summary, ending the redrawn line if there was one.
+// The per-file events are recorded as one line each rather than a bar. At one
+// line per file this stays readable in a log, and it is what makes a captured
+// run auditable afterwards: which files moved, in what order, and which failed.
+func (r *Reporter) DownloadStart(tgsource.Item)        {}
+func (r *Reporter) DownloadBytes(tgsource.Item, int64) {}
+func (r *Reporter) UploadStart(tgsource.Item)          {}
+
+func (r *Reporter) DownloadDone(it tgsource.Item, err error) {
+	if err != nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		fmt.Fprintf(r.w, "  download failed  %q: %v\n", it.Name, err)
+	}
+}
+
+func (r *Reporter) UploadDone(it tgsource.Item, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err != nil {
+		fmt.Fprintf(r.w, "  upload failed    %q: %v\n", it.Name, err)
+		return
+	}
+	fmt.Fprintf(r.w, "  archived  %-10s %q\n", humanBytes(it.Size()), it.Name)
+}
+
+// Finish writes the closing summary.
 func (r *Reporter) Finish(s pipeline.Stats) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.tty {
-		fmt.Fprint(r.w, "\r\033[K")
-	}
-	elapsed := time.Since(r.started).Round(time.Second)
-	fmt.Fprintf(r.w, "%d done, %d failed, %s in %s (%s/s)\n",
-		s.Done, s.Failed, humanBytes(s.BytesDone), elapsed,
-		humanBytes(int64(float64(s.BytesDone)/max(elapsed.Seconds(), 1))))
+	writeSummary(r.w, s, time.Since(r.started))
 }
 
 func (r *Reporter) line(s pipeline.Stats, now time.Time) string {
 	elapsed := now.Sub(r.started)
 	rate := float64(s.BytesDone) / max(elapsed.Seconds(), 1)
-	return fmt.Sprintf("%d/%d done, %d failed, %s of %s, %s/s",
-		s.Done, r.total, s.Failed,
-		humanBytes(s.BytesDone), humanBytes(r.totalBytes), humanBytes(int64(rate)))
+	eta := "—"
+	if rate > 0 && r.totalBytes > s.BytesDone {
+		eta = time.Duration(float64(r.totalBytes-s.BytesDone) / rate * float64(time.Second)).
+			Round(time.Second).String()
+	}
+	return fmt.Sprintf("  %s/%s files, %d failed, %s of %s, %s/s, ETA %s",
+		humanCount(s.Done), humanCount(r.total), s.Failed,
+		humanBytes(s.BytesDone), humanBytes(r.totalBytes), humanBytes(int64(rate)), eta)
 }
 
 func humanBytes(n int64) string {
@@ -117,3 +151,16 @@ func isTerminal(w io.Writer) bool {
 	}
 	return info.Mode()&os.ModeCharDevice != 0
 }
+
+// writeSummary prints the closing line both renderers end with.
+func writeSummary(w io.Writer, s pipeline.Stats, elapsed time.Duration) {
+	elapsed = elapsed.Round(time.Second)
+	fmt.Fprintf(w, "%s done, %s failed, %s in %s (%s/s)\n",
+		humanCount(s.Done), humanCount(s.Failed), humanBytes(s.BytesDone), elapsed,
+		humanBytes(int64(float64(s.BytesDone)/max(elapsed.Seconds(), 1))))
+}
+
+// HumanBytes and HumanCount are the shared formatters, exported so the commands
+// print the same shapes as the progress renderers do.
+func HumanBytes(n int64) string { return humanBytes(n) }
+func HumanCount(n int) string   { return humanCount(n) }
