@@ -48,6 +48,14 @@ type Live struct {
 	start time.Time
 }
 
+// LogWriter returns a writer whose lines are printed above the bars rather than
+// through them.
+//
+// rclone logs straight to stderr on its own schedule, so without this its error
+// lines land in the middle of a redraw and shred the display — which is exactly
+// what a run full of pikpak commit failures looked like.
+func (l *Live) LogWriter() io.Writer { return l.p }
+
 // NewLive builds a bar renderer over w for a run of the given size.
 func NewLive(w io.Writer, files int, bytes int64) *Live {
 	p := mpb.New(
@@ -74,7 +82,9 @@ func NewLive(w io.Writer, files int, bytes int64) *Live {
 		mpb.AppendDecorators(
 			decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 20}),
 			decor.AverageSpeed(decor.SizeB1024(0), " % .1f", decor.WC{W: 12}),
-			decor.OnComplete(decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 10}), ""),
+			// Wide enough for the three-digit hour counts a slow remote
+			// produces; at W:10 the ETA ran into the speed beside it.
+			decor.OnComplete(decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 13}), ""),
 		),
 	)
 	return l

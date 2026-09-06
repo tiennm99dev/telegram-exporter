@@ -50,12 +50,12 @@ type PlanInfo struct {
 func Plan(w io.Writer, p PlanInfo) {
 	cap := "uncapped"
 	if p.Budget > 0 {
-		cap = humanBytes(p.Budget)
+		cap = "capped at " + humanBytes(p.Budget)
 	}
 	fmt.Fprintf(w, "\n  fetching       %s files, %s (largest %s)\n",
 		humanCount(p.Files), humanBytes(p.Bytes), humanBytes(p.Largest))
 	fmt.Fprintf(w, "  into           %s\n", p.Destination)
-	fmt.Fprintf(w, "  staging        %s, capped at %s\n", p.Staging, cap)
+	fmt.Fprintf(w, "  staging        %s, %s\n", p.Staging, cap)
 	fmt.Fprintf(w, "  concurrency    %d download(s) x %d thread(s), %d upload(s)\n\n",
 		p.Downloads, p.Threads, p.Uploads)
 }

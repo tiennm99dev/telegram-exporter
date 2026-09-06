@@ -172,6 +172,11 @@ func syncCmd(ctx context.Context, args []string) error {
 		})
 
 		rep := report.Events(os.Stderr, len(todo), todoBytes)
+		// rclone logs to stderr on its own schedule, which lands in the middle
+		// of a bar redraw. Routing it through the renderer keeps both readable.
+		if live, ok := rep.(*report.Live); ok {
+			defer report.CaptureRcloneLog(ctx, live.LogWriter())()
+		}
 		var res pipeline.Result
 		res, runErr = pipeline.Run(ctx, sliceSeq(todo), pipeline.Options{
 			Pool:    pool,

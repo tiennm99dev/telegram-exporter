@@ -3,11 +3,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/iyear/tdl/core/tmedia"
+	"github.com/rclone/rclone/fs"
 
 	"github.com/tiennm99dev/telegram-exporter/internal/pipeline"
 	"github.com/tiennm99dev/telegram-exporter/internal/report"
@@ -51,11 +53,18 @@ func main() {
 	})
 
 	ev := report.Events(os.Stderr, 2613, 79<<30)
+	if live, ok := ev.(*report.Live); ok {
+		defer report.CaptureRcloneLog(context.Background(), live.LogWriter())()
+	}
 	st := pipeline.Stats{}
 	for _, f := range files {
 		ev.DownloadStart(f)
 	}
 	for step := range 30 {
+		if step == 12 {
+			fs.Errorf(nil, "1234567890_4245_1000000000000000003.jpg: Failed to copy: "+
+				"can't verify the task is completed")
+		}
 		for _, f := range files {
 			ev.DownloadBytes(f, f.Size()*int64(step+1)/30)
 		}
