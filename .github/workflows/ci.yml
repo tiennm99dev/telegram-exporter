@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./...
+
+      # Both tag combinations are compiled because they select different rclone
+      # backend sets. A dependency bump that breaks one can easily leave the
+      # other green, and rclone's library API is outside its compatibility
+      # promise, so this job is the tripwire for an unintended upgrade.
+      - name: compile (all backends)
+        run: go build ./...
+
+      - name: compile (slim)
+        run: go build -tags slim ./...

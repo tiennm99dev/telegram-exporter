@@ -1,0 +1,190 @@
+// Command tgexport archives Telegram chat media to an rclone remote.
+//
+// It replaces a three-script shell pipeline that ran `tdl dl` and `rclone move`
+// as separate processes. Both are embedded here as libraries, so the program can
+// see a download finish rather than inferring it from a filename suffix and a
+// file's age.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+
+	// Registers the rclone storage backends this binary can talk to. Backend
+	// selection is a property of the binary, so the import lives here rather
+	// than in a library package where it would leak into every importer and
+	// make the `slim` build tag meaningless.
+	_ "github.com/tiennm99dev/telegram-exporter/internal/backends"
+)
+
+// Exit codes, matching the shell pipeline so existing habits and any wrapper
+// scripts keep working: run.sh used 0 ok, 2 usage, 3 rclone failure, 130 SIGINT,
+// 143 SIGTERM, and export-until-complete.sh used 1 for "ran, still incomplete".
+const (
+	exitOK          = 0
+	exitIncomplete  = 1
+	exitUsage       = 2
+	exitRemoteError = 3
+	exitStalled     = 4
+	exitSIGINT      = 130
+	exitSIGTERM     = 143
+)
+
+// errUsage marks an error as the operator's mistake rather than a failure,
+// selecting exit code 2.
+var errUsage = errors.New("usage")
+
+// errIncomplete marks a run that finished cleanly but left work outstanding.
+var errIncomplete = errors.New("incomplete")
+
+// errStalled marks a run with work outstanding that no future run can do — every
+// remaining file has a name that cannot be written. It is distinct from
+// errIncomplete because a driver retrying on "incomplete" would otherwise walk
+// the whole history and re-index the whole remote forever, achieving nothing.
+var errStalled = errors.New("stalled")
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	if len(os.Args) < 2 {
+		usage()
+		return exitUsage
+	}
+	if a := os.Args[1]; a == "-h" || a == "--help" || a == "help" {
+		usage()
+		return exitOK
+	}
+
+	ctx, signalled := notifyContext()
+
+	var err error
+	switch os.Args[1] {
+	case "doctor":
+		err = doctorCmd(ctx, os.Args[2:])
+	case "list":
+		err = listCmd(ctx, os.Args[2:])
+	case "verify":
+		err = verifyCmd(ctx, os.Args[2:])
+	case "sync":
+		err = syncCmd(ctx, os.Args[2:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		return exitUsage
+	}
+
+	sig := signalled()
+	if sig != nil {
+		fmt.Fprintf(os.Stderr, "interrupted (%v)\n", sig)
+	} else if err != nil && !errors.Is(err, flag.ErrHelp) {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	}
+	return exitCode(err, sig)
+}
+
+// exitCode maps a command's outcome onto the shell pipeline's contract.
+//
+// A signal outranks whatever error the interruption produced on the way out:
+// the operator stopped this, and the code has to say so rather than letting a
+// driver read an abandoned run as finished.
+func exitCode(err error, sig os.Signal) int {
+	if sig != nil {
+		if sig == syscall.SIGTERM {
+			return exitSIGTERM
+		}
+		return exitSIGINT
+	}
+
+	switch {
+	case err == nil, errors.Is(err, flag.ErrHelp):
+		return exitOK
+	case errors.Is(err, context.Canceled):
+		return exitSIGINT
+	case errors.Is(err, errUsage):
+		return exitUsage
+	case errors.Is(err, errStalled):
+		return exitStalled
+	case errors.Is(err, errIncomplete):
+		return exitIncomplete
+	default:
+		return exitRemoteError
+	}
+}
+
+// notifyContext cancels ctx on SIGINT or SIGTERM and reports which arrived.
+//
+// Unlike signal.NotifyContext it stops trapping after the first signal, so a
+// second Ctrl-C kills the process outright. That matters when shutdown itself
+// hangs — an rclone upload waiting on a slow pikpak commit, say — and the
+// operator needs a way out that does not involve another terminal.
+func notifyContext() (context.Context, func() os.Signal) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+
+	var got os.Signal
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+		select {
+		case sig := <-ch:
+			got = sig
+			signal.Stop(ch) // next one gets the default disposition: die
+			cancel()
+		case <-done:
+			signal.Stop(ch)
+			cancel()
+		}
+	}()
+
+	// Waiting on finished before reading got is what makes the read safe: the
+	// goroutine writes it and then closes the channel, so the happens-before
+	// edge is the close, not the return.
+	return ctx, func() os.Signal {
+		close(done)
+		<-finished
+		return got
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `Usage: tgexport <command> [options]
+
+Commands:
+  sync      Archive a chat to a remote, fetching only what is missing
+  verify    Report whether a chat is fully archived on a remote
+  list      Print every media message in a chat as id<TAB>size<TAB>name
+  doctor    Check the Telegram session, the destination remote, and free space
+
+Exit codes:
+  0  complete            2  usage error          4  stalled: nothing left is fetchable
+  1  files remain        3  remote or Telegram failure
+  130/143  interrupted
+
+Only 1 is worth retrying; a driver looping until 0 should stop on anything else.
+
+Run 'tgexport <command> -h' for command options.
+`)
+}
+
+// commandUsage gives a subcommand a header its flag list can hang off.
+//
+// The flag package's default is "Usage of sync:" and a bare list, which says
+// neither what the command does nor which options are required.
+func commandUsage(fs *flag.FlagSet, line, summary string) {
+	fs.Usage = func() {
+		out := fs.Output()
+		fmt.Fprintf(out, "Usage: %s\n\n%s\n\nOptions:\n", line, summary)
+		fs.PrintDefaults()
+	}
+}

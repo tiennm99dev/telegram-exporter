@@ -1,305 +1,225 @@
 # telegram-exporter
 
-Export a Telegram chat's media to **any rclone remote** — S3, Google Drive,
-Dropbox, Backblaze B2, SFTP, WebDAV, or anything else rclone supports — using
-far less local disk than the chat's total size.
+Archive a Telegram chat's media to **any rclone remote** — S3, Google Drive,
+Dropbox, Backblaze B2, SFTP, WebDAV, pikpak, or anything else rclone supports —
+using far less local disk than the chat's total size.
 
-`run.sh` runs [tdl](https://github.com/iyear/tdl) and
-[rclone](https://rclone.org/) as a rolling pipeline: tdl downloads into a small
-staging directory while rclone concurrently moves finished files to the remote
-and deletes the local copies. Local disk only ever holds the files in flight
-plus one sync interval of throughput, so a multi-terabyte chat exports fine on a
-small disk. Telegram caps a single file at 2 GB (4 GB from premium uploaders),
-so a few dozen GB of staging covers the worst case regardless of chat size.
+`tgexport` embeds [tdl](https://github.com/iyear/tdl) and
+[rclone](https://rclone.org/) as libraries and runs both halves in one process.
+Files are downloaded into a small staging directory and uploaded the moment each
+one finishes, so local disk only ever holds what is in flight. A multi-terabyte
+chat archives fine on a small disk. Telegram caps a single file at 2 GB (4 GB
+from premium uploaders), so a few dozen GB of staging covers the worst case
+regardless of chat size.
 
-This is needed because **tdl can only write to a local directory** — it has no
-rclone integration and no remote destination of any kind (`tdl dl -d` takes a
-filesystem path; `tdl --storage` is its session database, not an output target).
-tdl downloads over MTProto with a user account, so Bot API limits do not apply:
-full history is readable and there is no 20 MB download cap.
+This exists because **tdl can only write to a local directory** — it has no
+remote destination of any kind (`tdl dl -d` takes a filesystem path; `tdl
+--storage` is its session database, not an output target). tdl downloads over
+MTProto with a user account, so Bot API limits do not apply: full history is
+readable and there is no 20 MB download cap.
 
 ## Requirements
 
-- **tdl** — <https://docs.iyear.me/tdl/getting-started/installation/>
-- **rclone** — <https://rclone.org/install/>
-- **bash**. On Windows, run under WSL or Git Bash.
+- **Go 1.25+** to build, or a prebuilt binary.
+- **tdl** — only for `tdl login`. <https://docs.iyear.me/tdl/getting-started/installation/>
+- **rclone** — only to configure a remote. <https://rclone.org/install/>
+
+Neither tool is invoked at run time; `tgexport` reads the session and config
+they write.
 
 ## Setup
 
 Both steps are one-time.
 
 ```bash
-# 1) log in to Telegram with your user account (phone + code + 2FA)
-tdl login
-
-# 2) configure the destination. The interactive wizard covers every backend:
-rclone config
-
-# ...or create one non-interactively, e.g.
-rclone config create gdrive drive
-rclone config create b2 b2 account=KEY_ID key=APP_KEY
-rclone config create dav webdav url=https://dav.example.com/remote.php/dav/files/you \
-  vendor=other user=YOU pass=SECRET
-
-rclone listremotes          # confirm the name you will pass to -r
+tdl login                 # writes the Telegram session tgexport reads
+rclone config             # define the destination remote
+go build -o tgexport ./cmd/tgexport
+./tgexport doctor -r myremote:archive
 ```
 
-Any rclone remote form works, including on-the-fly connection strings
-(`:webdav,url=https://...:/path`).
+`doctor` proves both halves work before a long run: it prints the logged-in
+account, resolves the destination, and reports free space.
+
+### Build variants
+
+| Build | Backends | Size |
+|---|---|---|
+| `go build ./cmd/tgexport` | every rclone backend | ~92 MB |
+| `go build -tags slim ./cmd/tgexport` | pikpak only | ~49 MB |
+
+A backend that is not compiled in does not exist at run time, so use the default
+build unless the destination will never change.
 
 ## Usage
 
 ```bash
-./run.sh -r gdrive:telegram/media -c @mygroup
+./tgexport sync -c CHAT -r REMOTE:PATH [options]
 ```
 
-That is the whole flow. It exports the chat's message metadata to
-`export.json`, then downloads and uploads concurrently until finished. Progress
-and warnings go to stderr; press Ctrl-C at any point and it stops cleanly.
+A run states what it found, what it is about to do, and then shows each file as
+it moves:
+
+```
+reading mychannel
+  12,000 messages read in 4m31s
+indexing PikPak root 'mychannel'
+  11,406 objects listed in 2m10s
+
+  chat holds     12,000 media, 250.0 GiB
+  archived       11,400
+    never fetched 600
+    wrong size    6
+
+  fetching       606 files, 79.0 GiB (largest 2.0 GiB)
+  into           PikPak root 'mychannel'
+  staging        ./staging, capped at 40.0 GiB
+  concurrency    2 download(s) x 4 thread(s), 2 upload(s)
+
+  ↓ total    26/606 files [=>             ] 617.5 MiB / 79.0 GiB  2.5 MiB/s  8h47m
+  ↑ total    24/606 files [=>             ] 598.0 MiB / 79.0 GiB  2.4 MiB/s  8h58m
+  ↓ …3214_4242_1000000000000000001.mp4   [=======>       ]  41.2 MiB / 96.0 MiB  1.8 MiB/s
+  ↑ …3214_4243_1000000000000000002.mp4   ⠹                         uploading 1.9 GiB
+```
+
+The two legs are counted separately because they run at different speeds and
+fail for different reasons. They normally track a file or two apart; a widening
+gap means the remote is falling behind and staging is filling up.
+
+Redirected output gets the same two figures as plain periodic lines, plus one
+line per archived file, with no cursor movement — a captured log stays readable:
+
+```
+  download 1,200/606 files, 45.0 GiB of 79.0 GiB, 76.8 MiB/s, ETA 7m33s
+  upload   1,190/606 files, 44.2 GiB of 79.0 GiB, 75.4 MiB/s, ETA 7m53s
+```
+
+`CHAT` accepts a numeric id as printed by `tdl chat ls`, a username with or
+without `@`, or a `t.me`/`tg://` link. A Bot API `-100…` id is converted
+automatically. A link to a single *message* is refused — it names a message, not
+a chat.
+
+```bash
+# archive a chat, capping staging at 40 GiB
+./tgexport sync -c @mychannel -r gdrive:telegram/media -m 40G
+
+# check completeness without downloading anything
+./tgexport verify -c @mychannel -r gdrive:telegram/media
+
+# list what the chat holds
+./tgexport list -c @mychannel
+```
 
 ### Options
 
-| Flag | Meaning |
-|------|---------|
-| `-r REMOTE:PATH` | **Required.** rclone destination, e.g. `gdrive:telegram/media`, `s3:bucket/tg`, `dav:tg-export` |
-| `-c CHAT` | Chat to export when the JSON does not exist yet — id, username, or link (see below) |
-| `-f FILE` | Export JSON to download from (default `export-<chat>.json` with `-c`, else `export.json`) |
-| `-d DIR` | Staging directory (default `./staging`) |
-| `-i SECONDS` | Seconds between rclone sweeps (default `60`) |
-| `-a AGE` | rclone `--min-age`, a second guard against moving files still being written (default `45s`) |
-| `-m SIZE` | Cap the staging directory at `SIZE` (`K`/`M`/`G`/`T`, binary), e.g. `40G`. Unset means no cap (see below) |
-| `-h` | Help |
+| Flag | Default | Meaning |
+|---|---|---|
+| `-c` | — | chat id, username, or link (required) |
+| `-r` | — | rclone destination, `REMOTE:PATH` (required) |
+| `-d` | `./staging` | staging directory for files in flight |
+| `-m` | no cap | cap staging at a size, e.g. `40G` |
+| `--threads` | 4 | connections per file |
+| `--limit` | 2 | files downloading at once |
+| `--uploads` | 2 | files uploading at once |
+| `--min-free` | 5 | stop if the remote has fewer than this many GiB free, checked before and during the run |
+| `--limit-items` | 0 | stop after N files; for smoke tests |
+| `--confirm` | true | re-state each uploaded file to prove its size |
+| `--takeout` | true | use a takeout session |
+| `-n` | `default` | tdl session namespace |
 
-### Identifying the chat
+### Exit codes
 
-`-c` accepts every form tdl understands, plus one it doesn't:
+| Code | Meaning |
+|---|---|
+| 0 | complete |
+| 1 | ran, but files remain — run again |
+| 2 | usage error |
+| 3 | remote or Telegram failure, including a destination that stopped accepting uploads |
+| 4 | stalled: files remain, none of which can ever be fetched |
+| 130 / 143 | interrupted (SIGINT / SIGTERM) |
 
-| Form | Example |
-|------|---------|
-| Numeric id, as printed by `tdl chat ls` | `-c 1697797156` |
-| Username, with or without `@` | `-c @mygroup` / `-c mygroup` |
-| Public link | `-c https://t.me/mygroup` / `-c t.me/mygroup` |
-| Deep link | `-c 'tg://resolve?domain=mygroup'` |
-| **Bot API id** (converted for you) | `-c -1001697797156` → `1697797156` |
+Only 1 is worth retrying. A driver looping until 0 should stop on anything else:
+3 and 4 both mean the next pass would do exactly what this one did.
 
-tdl resolves a numeric argument as an MTProto id and anything else through
-gotd's resolver. MTProto has no `-100` prefix, so a Bot API id would otherwise
-fail to resolve; the script strips it and logs the conversion.
+## How it works
 
-A **message** link is rejected — `-c` names a chat, not a message:
+Re-running is the resume path. Each item is checked against a listing of the
+remote immediately before download, so an interrupted run picks up where it left
+off and a completed one downloads nothing.
 
-```
-$ ./run.sh -r gdrive:tg -c https://t.me/mygroup/123
-error: -c takes a chat, not a message link — pass the chat's username or id
-```
+**Filenames.** Every file is stored as `{DialogID}_{MessageID}_{FileName}`, where
+`FileName` is exactly what Telegram reports. One function derives that string,
+and the same string is used both to ask whether the file is already archived and
+to write it — so the two can never disagree.
 
-Run `tdl chat ls` to see ids and usernames side by side.
+A name that cannot survive that round trip is refused rather than rewritten: too
+long for the filesystem once `.part` is appended, not a single path element, or
+containing a character rclone's path encoder rewrites (control bytes, `DEL`, and
+the encoder's own escape character). Those files are reported under
+`unarchivable` and never counted as present. Rewriting them is what the next
+paragraph is about.
 
-Each chat gets its own export file by default (`export-mygroup.json`,
-`export-1697797156.json`), so exporting a second chat from the same directory
-never reuses the first one's JSON. When the file already exists it is reused and
-the script says so — delete it to re-export.
+That last point is the reason this program exists. Its predecessor derived the
+name twice: `tdl chat export` wrote the raw name into a JSON, while `tdl dl`
+rendered it through a template applying `filenamify`, which rewrites characters a
+filesystem rejects and collapses runs of `!`. A file whose name contained `!!`
+was looked up under one name and stored under another, so the verifier never
+found it and re-fetched it on every pass — forever, at 966 MB a time.
 
-Anything after `--` is passed straight to `tdl dl`:
+Note the consequence: names are **not** run through `filenamify`, so they are not
+byte-compatible with what the old shell pipeline wrote. A file it stored under a
+rewritten name will not be recognised and gets fetched again.
 
-```bash
-./run.sh -r gdrive:telegram/media -- -t 4 -l 1      # calmer parallelism, fewer flood waits
-./run.sh -r gdrive:telegram/media -- -i mp4,mkv     # only these file extensions
-./run.sh -r gdrive:telegram/media -- -e jpg,png     # skip these file extensions
-```
+**Disk.** `-m` is a byte budget. A download reserves its own size before starting
+and releases it only once the upload is confirmed, so when the remote is slow the
+downloads pause on their own. The cap must exceed the largest single file, and a
+cap that does not is refused at startup rather than discovered as a hang.
 
-tdl defaults to `-t 8 -l 4`, which is aggressive; lower it if you hit flood
-waits on a large export.
+**Integrity.** A download is written to `<name>.part` and renamed only once its
+size matches what Telegram reported, so a file without the suffix is always
+whole. Uploads are re-stated afterwards to prove they arrived at the right size,
+before the local copy is gone, and an object that turns out short is deleted
+rather than left under a name a later run would trust.
 
-### Tuning the upload
+`verify` compares stored sizes against what Telegram reports, so a truncated
+object is outstanding rather than "present". This is stricter than the shell
+verifier, which matched on name and non-zero size — on the archive this was
+built for it found six objects that had been counted complete for months, one
+of them 221 MiB standing in for a 2 GiB video. Re-running repairs them.
 
-rclone reads every one of its flags from an environment variable, so the upload
-side is tunable without touching the script:
+## Replacing the shell pipeline
 
-```bash
-RCLONE_TRANSFERS=8 RCLONE_BWLIMIT=20M ./run.sh -r s3:bucket/tg -c @mygroup
-```
+Earlier versions of this repo were three bash scripts — `run.sh`,
+`export-until-complete.sh` and `verify-export.sh` — driving `tdl` and `rclone` as
+separate processes. Everything expensive in them existed to work around the fact
+that neither process could see the other's state: a staging directory polled with
+`du -sk`, an `--min-age` guard, a `*.tmp` exclusion, `SIGSTOP`/`SIGCONT` to
+enforce the disk cap, a sweep-failure counter, and an outer loop that re-verified
+and re-narrowed a JSON export between passes.
 
-`run.sh` sets two of those itself, and only when the caller has not:
+One process needs none of it. Completion is a function returning; the cap is a
+semaphore. Some hard-won details were worth keeping, and are:
 
-| Variable | Default here | rclone's own default | Why |
-|----------|--------------|----------------------|-----|
-| `RCLONE_TRANSFERS` | `2` | `4` | Backends that commit an upload as a server-side async task queue those tasks; less parallelism keeps the queue short |
-| `RCLONE_LOW_LEVEL_RETRIES` | `20` | `10` | Each retry re-polls a pending task, so a slow commit is waited out instead of failing the transfer |
+- **pikpak commits uploads as a server-side async task**, and rclone abandons a
+  still-pending one when its low-level retries run out. `transfers=2` and
+  `low-level-retries=20` are the defaults here for that reason. Environment
+  overrides still win.
+- **A backend with no quota API is treated as unlimited**, so it never blocks a
+  run.
+- **Zero-byte files count as missing** — rclone overwrites a size-mismatched
+  destination, so re-running repairs them — while files under 1 KiB are reported
+  but trusted, since some real media genuinely is that small.
+- **Indexing ignores `RCLONE_*` filters.** The transfer tunables above are
+  deliberately env-overridable; the listing is not. A stray `RCLONE_EXCLUDE` or
+  `RCLONE_MIN_SIZE` left over from another job would otherwise narrow the index
+  and re-download everything it hid.
 
-Both exist because of one failure mode. On pikpak an upload finishes in two
-phases — rclone sends the bytes, then a server-side task must reach
-`PHASE_TYPE_COMPLETE`. rclone waits 500 ms and then polls, giving up after
-`--low-level-retries` attempts with:
+## Notes
 
-```
-ERROR : <file>: Failed to copy: can't verify the task is completed: ... Phase:"PHASE_TYPE_PENDING"
-```
-
-Nothing is lost when that happens — the message is followed by `Not deleting
-source as copy failed`, the file stays in staging and the next sweep retries
-it. But it wastes the upload, and it counts against a `-m` cap, since a file
-that keeps failing can never be drained. Raise the retries further if you still
-see it.
-
-### Capping the staging directory
-
-Without `-m`, staging grows whenever tdl downloads faster than rclone uploads,
-which on a fast connection and a slow remote can mean tens of GB between
-sweeps. `-m` puts a ceiling on it:
-
-```bash
-./run.sh -r s3:bucket/tg -c @mygroup -m 40G
-```
-
-Staging size is checked every 10 seconds, independently of `-i`. When it
-reaches the cap, tdl is suspended with `SIGSTOP` and rclone sweeps until
-staging is back under it, then tdl is resumed — it reconnects on its own and
-`--continue` picks its `.tmp` files back up. Because the checks are periodic,
-the cap is a high-water mark rather than a hard limit: staging can overshoot by
-up to ten seconds of download throughput before the gate closes.
-
-Only finished files can be drained, so the cap has to exceed what the
-concurrent downloads hold — at most `-l` times 2 GB (4 GB from premium
-uploaders). With the default `-l 2` anything from ~10 GB up is safe; below
-that, the drain cannot clear the cap and the run logs a warning on every check
-instead of throttling.
-
-### Exporting a subset
-
-Generate the JSON yourself when you want a narrower export, then point `-f` at
-it:
-
-```bash
-tdl chat export -c @mygroup -T id -i 1000,5000 --all --with-content -o part.json
-./run.sh -r gdrive:telegram/media -f part.json
-```
-
-`tdl chat export` takes `-T time|id|last` with `-i` as the range, and `-f` as an
-expression filter over message fields (`-f -` lists the available fields).
-
-## Sweep output
-
-The periodic sweeps are silent — they run every `-i` seconds alongside tdl's own
-output, and narrating each one would drown it. The sweeps that run **once at the
-end** do report progress, since they can move the whole staging directory with
-nothing else on screen:
-
-- the exit sweep on Ctrl-C, `SIGTERM`, or a tdl failure (`sweeping completed
-  files before exit`);
-- the final sweep after tdl finishes successfully.
-
-On a terminal that is rclone's redrawn `--progress` bar. When output is
-redirected to a log it becomes a one-line stats summary every 30s
-(`--stats 30s --stats-one-line --stats-log-level NOTICE`) — rclone logs stats at
-INFO, so raising just the stats to NOTICE avoids the line-per-file spam that
-`-v` would add.
-
-To show progress on every sweep instead, rclone reads its flags from the
-environment:
-
-```bash
-RCLONE_PROGRESS=true ./run.sh -r s3:bucket/tg -c @mygroup
-```
-
-## Resuming
-
-Re-run the same command. Both legs resume independently and nothing is
-downloaded or uploaded twice.
-
-Keep the same `export.json` between runs: `--skip-same` compares against the
-**staging** directory, which is empty once files have moved to the remote, so
-cross-run deduplication rests on tdl's own `--continue` tracking. If you must
-start from a fresh export, narrow it to the missing message-id range
-(`-T id -i <last>,<max>`) rather than re-downloading everything.
-
-## Verifying an export
-
-`run.sh` finishes when tdl finishes, which is not the same as every file having
-arrived: a dropped session, a stalled remote, or an interrupted pass all leave
-gaps. `verify-export.sh` settles it by rebuilding the filename tdl produces for
-each media message in the export JSON and checking the remote for it.
-
-```bash
-./verify-export.sh -f export-mygroup.json -r remote:telegram/media
-```
-
-```
-messages in export : 18193
-  text-only (skip) : 38
-  media expected   : 12000
-present and intact : 12000
-  absent           : 0
-  zero-byte        : 0
-
-COMPLETE: every media message is present and non-empty.
-```
-
-Messages with no media are skipped; they carry an empty `file` and were never
-download targets. A zero-byte file counts as missing, because rclone overwrites a
-size-mismatched destination and a retry repairs it. Files under 1 KiB are
-reported but not retried, since some real media is genuinely that small. Exit
-status is 0 when complete and 1 otherwise, with the outstanding message ids
-written to `missing-ids.txt`.
-
-## Running until complete
-
-`export-until-complete.sh` drives `run.sh` in a loop: verify what is already
-there, narrow the export to the ids still missing, run the pipeline on that
-subset, and repeat.
-
-```bash
-./export-until-complete.sh -r remote:telegram/media -c @mygroup
-```
-
-| Flag | Meaning |
-|------|---------|
-| `-r REMOTE:PATH` | **Required.** rclone destination |
-| `-c CHAT` | Chat to export metadata for on the first pass |
-| `-f FILE` | Export JSON (default `export-<chat>.json`) |
-| `-d DIR` | Staging directory (default `./staging`) |
-| `-i SECONDS` | rclone sweep interval (default `120`) |
-| `-m SIZE` | Staging cap passed through to `run.sh`, e.g. `40G` |
-| `-p N` | Maximum passes (default `30`) |
-| `-q GIB` | Stop if remote free space falls below this (default `5`) |
-
-It stops when the verifier reports complete (exit `0`), when a pass fetches
-nothing new (exit `1` — the remaining media is no longer available from
-Telegram), when the remote runs low on space (exit `3`), or on Ctrl-C (exit
-`130`, after the current pass shuts down cleanly).
-
-tdl's progress bar is shown when stdout is a terminal and suppressed when output
-is redirected, so a log file stays readable without a flag.
-
-## What it guards against
-
-- **Partial uploads.** tdl writes `<name>.tmp` and renames on completion, so
-  every sweep excludes `*.tmp`. Age alone is not a completion signal: a download
-  stalled by a flood wait stops touching its `.tmp`, which would then be
-  uploaded half-written and lose its resume point.
-- **Directories vanishing under tdl.** `--delete-empty-src-dirs` runs only in
-  the final sweep, and the staging directory is recreated after every sweep.
-  Removing a directory under a running tdl makes it fail to create its next file.
-- **Orphaned downloads.** tdl is stopped on exit, Ctrl-C, or `SIGTERM`, so no
-  download keeps running after the script is gone.
-- **A failed run looking finished.** The unrestricted final sweep happens only
-  after tdl exits 0. An interrupted or crashed run gets the age-guarded sweep
-  and keeps staging for the next attempt.
-- **A dead remote filling the disk.** Five consecutive rclone failures abort the
-  run instead of letting staging grow unbounded.
-- **A fast connection filling the disk.** With `-m`, tdl is suspended whenever
-  staging reaches the cap and resumed once rclone has drained it, so download
-  throughput cannot outrun the upload leg.
-- **Typos and bad credentials.** Before downloading anything, the remote must be
-  present in `rclone listremotes` (skipped for connection strings) and the
-  destination must be creatable, which proves both reachability and auth.
-
-Exit codes: `0` success, `2` usage error, `3` rclone failure, `130`/`143`
-interrupted, anything else is tdl's own exit code.
-
-## Limits
-
-- Streaming with no staging at all (piping download chunks straight to the
-  remote) is not possible with tdl and would require custom code.
-- The script is bash; the two tools it drives are cross-platform, but Windows
-  needs WSL or Git Bash.
+- `tgexport` and the `tdl` CLI share one session store and cannot run against the
+  same namespace at once. Use `-n` for a second namespace if you need both.
+- A partially downloaded file is not resumable across restarts — tdl's library
+  exposes no resume offset — so an interrupted run re-fetches whatever was in
+  flight, bounded by `--limit`.
+- Everything is read-only against Telegram. Nothing is uploaded, deleted, or
+  marked read.
