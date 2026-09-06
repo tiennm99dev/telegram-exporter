@@ -65,6 +65,8 @@ func run() int {
 		err = listCmd(ctx, os.Args[2:])
 	case "verify":
 		err = verifyCmd(ctx, os.Args[2:])
+	case "sync":
+		err = syncCmd(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
 		usage()
@@ -150,9 +152,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `Usage: tgexport <command> [options]
 
 Commands:
-  doctor    Check the Telegram session, the destination remote, and free space
+  sync      Archive a chat to a remote, fetching only what is missing
   list      Print every media message in a chat as id<TAB>size<TAB>name
   verify    Report whether a chat is fully archived on a remote
+  doctor    Check the Telegram session, the destination remote, and free space
 
 Run 'tgexport <command> -h' for command options.
 `)

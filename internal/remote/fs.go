@@ -98,6 +98,20 @@ func Resolve(ctx context.Context, remote string) (fs.Fs, error) {
 	return f, nil
 }
 
+// EnsureDir creates the destination if it is not there yet.
+//
+// A destination that does not exist yet is the normal case for a first run, and
+// the shell pipeline created it up front for the same reason — the call doubles
+// as the reachability and credentials check, since a remote that refuses a
+// mkdir will refuse the uploads too. Doing it before the chat is read means a
+// bad destination fails in seconds rather than after a full history walk.
+func EnsureDir(ctx context.Context, f fs.Fs) error {
+	if err := f.Mkdir(ctx, ""); err != nil {
+		return fmt.Errorf("cannot create %q — check credentials and connectivity: %w", f.String(), err)
+	}
+	return nil
+}
+
 // FreeBytes reports free space on the remote.
 //
 // Backends without quota reporting return ok=false rather than an error: the

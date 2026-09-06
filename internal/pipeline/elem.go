@@ -64,6 +64,12 @@ type elemIter struct {
 	staging string
 	takeout bool
 
+	// acquire reserves staging space for the next item. Blocking here is what
+	// makes backpressure work: core's Download calls Next from its dispatch
+	// loop, so a blocked Next stops new downloads starting without stopping the
+	// uploads that free the space.
+	acquire func(context.Context, int64) error
+
 	current *elem
 	err     error
 
@@ -102,6 +108,13 @@ func (i *elemIter) Next(ctx context.Context) bool {
 	if err := naming.Safe(item.Name); err != nil {
 		i.err = fmt.Errorf("message %d: %w", item.MessageID, err)
 		return false
+	}
+
+	if i.acquire != nil {
+		if err := i.acquire(ctx, item.Size()); err != nil {
+			i.err = err
+			return false
+		}
 	}
 
 	f, err := os.OpenFile(partPath(i.staging, item), os.O_CREATE|os.O_RDWR, 0o600)

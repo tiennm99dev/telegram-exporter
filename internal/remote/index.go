@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -88,6 +89,12 @@ func BuildIndex(ctx context.Context, f fs.Fs, dialogID int64) (*Index, error) {
 			idx.byID[id] = append(idx.byID[id], name)
 		}
 	}); err != nil {
+		// A destination that does not exist yet holds nothing. That is an empty
+		// index, not a failure — it is what a first run against a new path looks
+		// like, and treating it as an error would make verify unusable there.
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return idx, nil
+		}
 		return nil, fmt.Errorf("list %s: %w", f.String(), err)
 	}
 	return idx, nil
