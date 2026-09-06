@@ -141,3 +141,48 @@ func TestUploadMovesAndConfirms(t *testing.T) {
 		t.Error("the staged copy survived a successful move")
 	}
 }
+
+// The recovery the retry exists for: the first attempt fails, the condition
+// clears, and the second attempt succeeds — without the file having to be
+// downloaded again.
+//
+// The destination is made unwritable so the first move genuinely fails inside
+// rclone, and the backoff hook restores it. Faking the error would only test
+// the loop against itself; this exercises the real MoveFile path.
+func TestUploadSucceedsOnRetryAfterTheRemoteRecovers(t *testing.T) {
+	u, it, dstDir, stageDir := settleFixture(t, -1, 4096)
+	u.confirm = true
+
+	if err := os.Chmod(dstDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dstDir, 0o700) })
+
+	restore := uploadBackoff
+	t.Cleanup(func() { uploadBackoff = restore })
+	var backoffs int
+	uploadBackoff = func(int) time.Duration {
+		backoffs++
+		if err := os.Chmod(dstDir, 0o700); err != nil {
+			t.Errorf("restore destination: %v", err)
+		}
+		return time.Millisecond
+	}
+
+	if err := u.upload(t.Context(), it); err != nil {
+		t.Fatalf("upload did not recover on retry: %v", err)
+	}
+	if backoffs == 0 {
+		t.Error("the first attempt did not fail, so no retry was exercised")
+	}
+	info, err := os.Stat(filepath.Join(dstDir, settleName))
+	if err != nil {
+		t.Fatalf("object not on the destination after the retry: %v", err)
+	}
+	if info.Size() != it.Size() {
+		t.Errorf("object is %d bytes, want %d", info.Size(), it.Size())
+	}
+	if _, err := os.Stat(filepath.Join(stageDir, settleName)); !os.IsNotExist(err) {
+		t.Error("the staged copy survived a successful retry")
+	}
+}
