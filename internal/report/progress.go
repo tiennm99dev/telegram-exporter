@@ -41,10 +41,17 @@ func New(w io.Writer, total int, totalBytes int64) *Reporter {
 	return &Reporter{w: w, tty: isTerminal(w), total: total, totalBytes: totalBytes, started: time.Now()}
 }
 
-// Update renders a snapshot. Safe to call from several goroutines, and cheap
-// enough to call on every progress callback.
+// Update renders a snapshot. Safe to call from several goroutines.
+//
+// A contended update is dropped rather than queued. Every download worker calls
+// this on each progress callback, so holding the lock across the write would
+// make terminal latency — an ssh session with a slow link, say — throttle the
+// downloads themselves. A skipped frame costs nothing; the next callback is
+// milliseconds away and Finish always prints.
 func (r *Reporter) Update(s pipeline.Stats) {
-	r.mu.Lock()
+	if !r.mu.TryLock() {
+		return
+	}
 	defer r.mu.Unlock()
 
 	now := time.Now()

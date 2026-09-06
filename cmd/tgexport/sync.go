@@ -36,27 +36,27 @@ var retiredFlags = map[string]string{
 // syncCmd archives a chat to a remote: read the chat, skip what is already
 // there, download and upload the rest, then report on the result.
 func syncCmd(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("sync", flag.ContinueOnError)
+	flags := flag.NewFlagSet("sync", flag.ContinueOnError)
 	var (
-		chat       = fs.String("c", "", "chat id, username, or t.me link (required)")
-		remoteArg  = fs.String("r", "", "rclone destination, e.g. pikpak:archive (required)")
-		staging    = fs.String("d", "./staging", "staging directory for files in flight")
-		maxStaging = fs.String("m", "", "cap staging at this size, e.g. 40G (default: no cap)")
-		threads    = fs.Int("threads", 4, "connections per file")
-		limit      = fs.Int("limit", 2, "files downloading at once")
-		uploads    = fs.Int("uploads", 2, "files uploading at once")
-		minFree    = fs.Int64("min-free", 5, "stop if the remote has fewer than this many GiB free")
-		limitItems = fs.Int("limit-items", 0, "stop after this many files (0 means no limit)")
-		confirm    = fs.Bool("confirm", true, "re-state each uploaded file to prove its size")
-		takeout    = fs.Bool("takeout", true, "use a takeout session, as `tdl dl --takeout` did")
-		ns         = fs.String("n", "default", "tdl session namespace")
-		dataDir    = fs.String("storage", tdlkv.DefaultDir(), "tdl bolt storage directory")
+		chat       = flags.String("c", "", "chat id, username, or t.me link (required)")
+		remoteArg  = flags.String("r", "", "rclone destination, e.g. pikpak:archive (required)")
+		staging    = flags.String("d", "./staging", "staging directory for files in flight")
+		maxStaging = flags.String("m", "", "cap staging at this size, e.g. 40G (default: no cap)")
+		threads    = flags.Int("threads", 4, "connections per file")
+		limit      = flags.Int("limit", 2, "files downloading at once")
+		uploads    = flags.Int("uploads", 2, "files uploading at once")
+		minFree    = flags.Int64("min-free", 5, "stop if the remote has fewer than this many GiB free")
+		limitItems = flags.Int("limit-items", 0, "stop after this many files (0 means no limit)")
+		confirm    = flags.Bool("confirm", true, "re-state each uploaded file to prove its size")
+		takeout    = flags.Bool("takeout", true, "use a takeout session, as `tdl dl --takeout` did")
+		ns         = flags.String("n", "default", "tdl session namespace")
+		dataDir    = flags.String("storage", tdlkv.DefaultDir(), "tdl bolt storage directory")
 	)
 	for name, replacement := range retiredFlags {
-		fs.Var(retiredFlag{name, replacement}, name, "retired")
+		flags.Var(retiredFlag{name, replacement}, name, "retired")
 	}
 
-	if err := fs.Parse(args); err != nil {
+	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return err
 		}
@@ -169,7 +169,11 @@ func syncCmd(ctx context.Context, args []string) error {
 			fmt.Fprintf(os.Stderr, "  message %d failed: %v\n", f.Item.MessageID, f.Err)
 		}
 		if runErr != nil {
-			return runErr
+			// Reported, not returned yet: a run that archived thousands of files
+			// and hit one transient upload error has still made progress, and
+			// suppressing the report would leave the operator — and any driver
+			// reading the exit code — unable to tell that from a total failure.
+			fmt.Fprintf(os.Stderr, "run ended early: %v\n", runErr)
 		}
 
 		// The remote is re-indexed rather than assumed: the run's own view of

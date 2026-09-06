@@ -7,6 +7,7 @@ require (
 	github.com/iyear/tdl/core v0.20.4
 	github.com/rclone/rclone v1.75.1
 	go.etcd.io/bbolt v1.5.0
+	golang.org/x/sync v0.22.0
 )
 
 require (
@@ -227,7 +228,6 @@ require (
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

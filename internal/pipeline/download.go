@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/iyear/tdl/core/dcpool"
 	"github.com/iyear/tdl/core/downloader"
@@ -29,8 +30,14 @@ type DownloadOptions struct {
 	Report func(Stats)
 
 	// acquire reserves staging space before a download starts, blocking until
-	// there is room. Unset means no bound.
+	// there is room. Unset means no bound. release hands a reservation back for
+	// an item that never reaches a download.
 	acquire func(context.Context, int64) error
+	release func(int64)
+
+	// stop, when set, ends iteration cleanly from another goroutine — used to
+	// halt downloads once the destination has stopped accepting uploads.
+	stop *atomic.Bool
 	// onReady hands a completed file to the upload leg; onFailed says nothing
 	// was staged, so whatever acquire reserved must be given back.
 	onReady  func(tgsource.Item)
@@ -39,12 +46,13 @@ type DownloadOptions struct {
 
 // Download fetches every item in seq into the staging directory.
 //
-// Each file is written to <name>.part and renamed to <name> only once the
-// downloader reports it complete, so a name without the suffix is always a
-// whole file. That is what lets the upload half treat "the file exists" as
-// "the file is finished" — the property the shell pipeline had to approximate
-// with a filename convention plus an age guard, because it could not see
-// inside tdl.
+// Each file is written to <name>.part and renamed to <name> only once its size
+// matches what Telegram reported, so a name without the suffix is always a whole
+// file. Uploads are driven by completion rather than by scanning for that, but
+// the invariant still matters: it is what makes a leftover file from an
+// interrupted run safe to keep and a leftover .part safe to delete. The shell
+// pipeline could only approximate it with a filename convention plus an age
+// guard, because it could not see inside tdl.
 //
 // A failed item does not abort the run: it is recorded in the returned outcomes
 // and the rest continue, matching what a partial `tdl dl` pass did.
@@ -61,6 +69,10 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 
 	it := newElemIter(seq, o.Staging, o.Takeout)
 	it.acquire = o.acquire
+	it.release = o.release
+	if o.stop != nil {
+		it.stopped = o.stop
+	}
 	defer func() { _ = it.Close() }()
 
 	prog := newProgress(func(e *elem, err error) error {
@@ -85,6 +97,12 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 	}).Download(ctx, o.Limit)
 
 	outcomes, stats := prog.results()
+	// The iterator's failure is read only now, after Download has joined every
+	// worker. Reporting it through Iter.Err would have made Download skip that
+	// join entirely.
+	if err == nil {
+		err = it.failure
+	}
 	return outcomes, stats, err
 }
 

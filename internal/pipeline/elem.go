@@ -8,6 +8,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/gotd/td/tg"
 
@@ -59,37 +60,57 @@ func finalPath(staging string, it tgsource.Item) string {
 // bridges them without this code owning a goroutine or a channel, which is why
 // Walk returns a sequence in the first place.
 type elemIter struct {
-	next    func() (tgsource.Item, error, bool)
-	stop    func()
-	staging string
-	takeout bool
+	next     func() (tgsource.Item, error, bool)
+	stopPull func()
+	staging  string
+	takeout  bool
 
 	// acquire reserves staging space for the next item. Blocking here is what
 	// makes backpressure work: core's Download calls Next from its dispatch
-	// loop, so a blocked Next stops new downloads starting without stopping the
-	// uploads that free the space.
+	// loop (downloader.go:38), so a blocked Next stops new downloads starting
+	// without stopping the uploads that free the space.
 	acquire func(context.Context, int64) error
+	// release hands a reservation back when the item never reaches a download.
+	release func(int64)
 
 	current *elem
-	err     error
 
-	// opened records every file handle so a run can close them all. The
-	// downloader never closes what To() hands it, and a leak here is thousands
-	// of descriptors on a full archive run.
+	// failure holds why iteration stopped, and Err deliberately does not return
+	// it. core's Download skips wg.Wait entirely when Iter.Err is non-nil
+	// (downloader.go:65-68), abandoning workers that are still running — which
+	// would let this package tear down its upload channel underneath them. So
+	// Next reports "no more items" and the caller reads failure() afterwards,
+	// guaranteeing every worker has finished first.
+	failure error
+	// stopped ends iteration without an error, for a caller that has decided the
+	// run cannot usefully continue. Supplied by the caller so it can be set from
+	// another goroutine without racing on the iterator itself.
+	stopped *atomic.Bool
+
+	// opened records every file handle. finish closes each one on the normal
+	// path, so this is not what keeps descriptors from leaking; it is the
+	// backstop for items that were opened but never reached finish, which is
+	// what an aborted iteration leaves behind.
 	opened []*os.File
 }
 
 func newElemIter(seq iter.Seq2[tgsource.Item, error], staging string, takeout bool) *elemIter {
-	next, stop := iter.Pull2(seq)
-	return &elemIter{next: next, stop: stop, staging: staging, takeout: takeout}
+	next, stopPull := iter.Pull2(seq)
+	return &elemIter{
+		next:     next,
+		stopPull: stopPull,
+		staging:  staging,
+		takeout:  takeout,
+		stopped:  new(atomic.Bool),
+	}
 }
 
 func (i *elemIter) Next(ctx context.Context) bool {
-	if i.err != nil {
+	if i.failure != nil || i.stopped.Load() {
 		return false
 	}
 	if err := ctx.Err(); err != nil {
-		i.err = err
+		i.failure = err
 		return false
 	}
 
@@ -98,7 +119,7 @@ func (i *elemIter) Next(ctx context.Context) bool {
 		return false
 	}
 	if err != nil {
-		i.err = err
+		i.failure = err
 		return false
 	}
 
@@ -106,20 +127,25 @@ func (i *elemIter) Next(ctx context.Context) bool {
 	// os.Create: the error names the message, and the run continues instead of
 	// failing on a path that could never have worked.
 	if err := naming.Safe(item.Name); err != nil {
-		i.err = fmt.Errorf("message %d: %w", item.MessageID, err)
+		i.failure = fmt.Errorf("message %d: %w", item.MessageID, err)
 		return false
 	}
 
 	if i.acquire != nil {
 		if err := i.acquire(ctx, item.Size()); err != nil {
-			i.err = err
+			i.failure = err
 			return false
 		}
 	}
 
 	f, err := os.OpenFile(partPath(i.staging, item), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		i.err = fmt.Errorf("open destination for message %d: %w", item.MessageID, err)
+		// The reservation is handed back here because this item will never
+		// reach a download, so no OnDone will ever release it for us.
+		if i.release != nil {
+			i.release(item.Size())
+		}
+		i.failure = fmt.Errorf("open destination for message %d: %w", item.MessageID, err)
 		return false
 	}
 	i.opened = append(i.opened, f)
@@ -129,11 +155,14 @@ func (i *elemIter) Next(ctx context.Context) bool {
 }
 
 func (i *elemIter) Value() downloader.Elem { return i.current }
-func (i *elemIter) Err() error             { return i.err }
+
+// Err always reports nil so core's Download reaches wg.Wait and joins its
+// workers. See the failure field.
+func (i *elemIter) Err() error { return nil }
 
 // Close releases the pull iterator and every file the walk opened.
 func (i *elemIter) Close() error {
-	i.stop()
+	i.stopPull()
 	var firstErr error
 	for _, f := range i.opened {
 		if err := f.Close(); err != nil && firstErr == nil {

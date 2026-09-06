@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -141,12 +142,11 @@ func TestElemIterRejectsUnsafeNames(t *testing.T) {
 	if it.Next(t.Context()) {
 		t.Fatal("iterator accepted a name that escapes the staging directory")
 	}
-	err := it.Err()
-	if err == nil {
-		t.Fatal("Err() = nil after rejecting an unsafe name")
+	if it.failure == nil {
+		t.Fatal("no failure recorded after rejecting an unsafe name")
 	}
-	if !strings.Contains(err.Error(), "message 7") {
-		t.Errorf("error should name the message, got: %v", err)
+	if !strings.Contains(it.failure.Error(), "message 7") {
+		t.Errorf("failure should name the message, got: %v", it.failure)
 	}
 }
 
@@ -183,8 +183,8 @@ func TestElemIterOpensPartFilesAndPropagatesWalkErrors(t *testing.T) {
 		if it.Next(t.Context()) {
 			t.Fatal("Next() = true after a walk error")
 		}
-		if !errors.Is(it.Err(), want) {
-			t.Errorf("Err() = %v, want %v", it.Err(), want)
+		if !errors.Is(it.failure, want) {
+			t.Errorf("failure = %v, want %v", it.failure, want)
 		}
 	})
 }
@@ -286,5 +286,114 @@ func TestFinishAcceptsExactSize(t *testing.T) {
 	}
 	if info.Size() != 2048 {
 		t.Errorf("final size = %d, want 2048", info.Size())
+	}
+}
+
+// Err must always report nil, however badly iteration went.
+//
+// core's Download skips wg.Wait entirely when Iter.Err is non-nil
+// (downloader.go:65-68), returning while its workers are still running. The
+// pipeline closes its upload channel as soon as Download returns, so a non-nil
+// Err here means workers send on a closed channel and the process panics —
+// on every Ctrl-C, since cancellation is one of the ways iteration stops.
+func TestElemIterNeverReportsErrToTheDownloader(t *testing.T) {
+	staging := t.TempDir()
+
+	cases := map[string]func() *elemIter{
+		"walk error": func() *elemIter {
+			seq := func(yield func(tgsource.Item, error) bool) {
+				yield(tgsource.Item{}, errors.New("boom"))
+			}
+			return newElemIter(seq, staging, false)
+		},
+		"unsafe name": func() *elemIter {
+			seq := func(yield func(tgsource.Item, error) bool) {
+				yield(testItem(t, 1, "../escape", 10), nil)
+			}
+			return newElemIter(seq, staging, false)
+		},
+		"cancelled": func() *elemIter {
+			seq := func(yield func(tgsource.Item, error) bool) {
+				yield(testItem(t, 2, "a.mp4", 10), nil)
+			}
+			return newElemIter(seq, staging, false)
+		},
+	}
+
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			it := build()
+			defer func() { _ = it.Close() }()
+
+			ctx := t.Context()
+			if name == "cancelled" {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			for it.Next(ctx) {
+			}
+			if err := it.Err(); err != nil {
+				t.Errorf("Err() = %v, want nil — a non-nil Err makes Download abandon its workers", err)
+			}
+			if it.failure == nil {
+				t.Error("the real failure was not stashed")
+			}
+		})
+	}
+}
+
+// A caller-set stop flag ends iteration without looking like a failure, which is
+// how the circuit breaker halts downloads.
+func TestElemIterStopsOnFlagWithoutRecordingFailure(t *testing.T) {
+	staging := t.TempDir()
+	seq := func(yield func(tgsource.Item, error) bool) {
+		for i := 1; i <= 5; i++ {
+			if !yield(testItem(t, i, "a.mp4", 10), nil) {
+				return
+			}
+		}
+	}
+	it := newElemIter(seq, staging, false)
+	defer func() { _ = it.Close() }()
+
+	if !it.Next(t.Context()) {
+		t.Fatal("first Next() = false")
+	}
+	it.stopped.Store(true)
+
+	if it.Next(t.Context()) {
+		t.Error("Next() = true after the stop flag was set")
+	}
+	if it.failure != nil {
+		t.Errorf("failure = %v, want nil — stopping is not a failure", it.failure)
+	}
+}
+
+// A reservation must come back when the item never reaches a download, or the
+// budget shrinks by that much for the rest of the run.
+func TestElemIterReturnsReservationWhenOpenFails(t *testing.T) {
+	// A staging path that is a file, not a directory, makes OpenFile fail.
+	staging := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(staging, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	seq := func(yield func(tgsource.Item, error) bool) {
+		yield(testItem(t, 1, "a.mp4", 4096), nil)
+	}
+	it := newElemIter(seq, staging, false)
+	defer func() { _ = it.Close() }()
+
+	var acquired, released int64
+	it.acquire = func(_ context.Context, n int64) error { acquired += n; return nil }
+	it.release = func(n int64) { released += n }
+
+	if it.Next(t.Context()) {
+		t.Fatal("Next() succeeded with an unusable staging directory")
+	}
+	if acquired != released {
+		t.Errorf("acquired %d bytes but released %d — the reservation leaked", acquired, released)
 	}
 }

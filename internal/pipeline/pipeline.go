@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/rclone/rclone/fs"
 	"golang.org/x/sync/semaphore"
@@ -53,6 +56,11 @@ func (r Result) Failed() []Outcome {
 	return out
 }
 
+// maxRecordedErrors bounds what a run keeps from a failing remote. Past this,
+// the pattern is established and joining thousands of identical strings just
+// makes the final message unreadable.
+const maxRecordedErrors = 10
+
 // Run downloads every item and uploads each one as it completes.
 //
 // This is the whole reason for the rewrite. run.sh could not see inside tdl, so
@@ -60,13 +68,17 @@ func (r Result) Failed() []Outcome {
 // `du -sk` every ten seconds, and enforced its disk cap by sending SIGSTOP and
 // SIGCONT to the tdl process. None of that exists here. Completion is a function
 // returning. The cap is a semaphore: a download acquires its own size before
-// starting and releases it only once the upload has confirmed, so when the
-// remote is slow the acquire blocks and downloads pause on their own.
+// starting and releases it once the file is off local disk, so when the remote
+// is slow the acquire blocks and downloads pause on their own.
 //
-// Blocking in the iterator is safe by construction — core's Download calls
-// Iter.Next from its dispatch loop while workers run in an errgroup, so a
-// blocked Next stalls new work without stopping the uploads that free the budget
-// (downloader.go:36-63).
+// Blocking in the iterator is safe, but not for the reason it first appears.
+// core's Download calls Iter.Next from its dispatch loop while workers run in an
+// errgroup, so a blocked Next stalls new work without stopping the uploads that
+// free the budget. What is *not* safe is reporting an error through Iter.Err:
+// Download then returns without joining its workers (downloader.go:65-68), and
+// tearing down the upload channel underneath them panics. So elemIter always
+// reports a nil Err and stashes the real one, which Download's return
+// guarantees is safe to read.
 func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (Result, error) {
 	if o.Uploads <= 0 {
 		o.Uploads = 1
@@ -84,37 +96,51 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 	budget := newBudget(o.Budget)
 	uploads := make(chan tgsource.Item, o.Uploads)
 
-	// Upload workers own the release side of the budget, so every path out of
-	// one — success, failure, cancellation — must release, or the run deadlocks
-	// with downloads waiting on space that is never freed.
 	var (
-		wg         sync.WaitGroup
-		mu         sync.Mutex
-		uploadErrs []error
-		streak     int
-		tripped    bool
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		errs    []error
+		nErrs   int
+		streak  int
+		tripped bool
 	)
-	upCtx, tripRun := context.WithCancel(ctx)
-	defer tripRun()
+
+	// stopDownloads ends the download side once the destination has stopped
+	// accepting work. It stops the iterator rather than cancelling a context,
+	// because cancelling only the uploads would leave downloads running at full
+	// speed against a remote that is refusing them — every file staying on disk,
+	// every reservation released on the way out. A broken remote would fill the
+	// local disk faster than a working one does.
+	stopDownloads := new(atomic.Bool)
 
 	for range o.Uploads {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for it := range uploads {
-				err := up.upload(upCtx, it)
+				err := up.upload(ctx, it)
+
+				if err != nil {
+					// MoveFile leaves the local copy in place when it fails, so
+					// the reservation cannot simply be handed back — the bytes
+					// are still on disk. Removing the file first is what keeps
+					// the cap honest.
+					if rerr := os.Remove(filepath.Join(o.Staging, it.Name)); rerr != nil && !os.IsNotExist(rerr) {
+						err = errors.Join(err, fmt.Errorf("and it is still in staging: %w", rerr))
+					}
+				}
 				budget.release(it.Size())
 
 				mu.Lock()
 				if err != nil {
-					uploadErrs = append(uploadErrs, err)
+					if nErrs < maxRecordedErrors {
+						errs = append(errs, err)
+					}
+					nErrs++
 					streak++
 					if streak >= o.MaxFailures && !tripped {
-						// A remote that fails this many times running is not
-						// going to recover on its own, and continuing just fills
-						// staging until the disk does.
 						tripped = true
-						tripRun()
+						stopDownloads.Store(true)
 					}
 				} else {
 					streak = 0
@@ -132,20 +158,24 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 		Takeout: o.Takeout,
 		Report:  o.Report,
 		acquire: budget.acquire,
+		release: budget.release,
 		onReady: func(it tgsource.Item) { uploads <- it },
 		onFailed: func(it tgsource.Item) {
 			// Nothing was staged, so the reservation has to come back here
 			// instead of from an upload that will never happen.
 			budget.release(it.Size())
 		},
+		stop: stopDownloads,
 	})
 
+	// Safe only because Download joined its workers, which is guaranteed by
+	// elemIter.Err always being nil.
 	close(uploads)
 	wg.Wait()
 
 	mu.Lock()
-	errs := append([]error(nil), uploadErrs...)
-	trip := tripped
+	joined := errors.Join(errs...)
+	trip, total := tripped, nErrs
 	mu.Unlock()
 
 	res := Result{Stats: stats, Outcomes: dlOutcomes}
@@ -153,10 +183,10 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 	case dlErr != nil:
 		return res, dlErr
 	case trip:
-		return res, fmt.Errorf("stopping after %d consecutive upload failures: %w",
-			o.MaxFailures, errors.Join(errs...))
-	case len(errs) > 0:
-		return res, errors.Join(errs...)
+		return res, fmt.Errorf("stopped after %d consecutive upload failures (%d total): %w",
+			o.MaxFailures, total, joined)
+	case total > 0:
+		return res, fmt.Errorf("%d upload(s) failed: %w", total, joined)
 	}
 	return res, nil
 }
@@ -176,10 +206,10 @@ func (b *budget) acquire(ctx context.Context, n int64) error {
 	if b.sem == nil {
 		return nil
 	}
-	// An item larger than the whole budget could never be admitted and would
-	// block forever, so it is refused with an error that says what to change.
-	// Callers validate up front too; this is the guard for an item whose size
-	// was not known then.
+	// An item larger than the budget cannot be admitted, and semaphore.Acquire
+	// handles that by blocking until the context is cancelled rather than
+	// failing — so there is no error to surface and no guard to add here. The
+	// real protection is validateBudget refusing such a run before it starts.
 	if err := b.sem.Acquire(ctx, n); err != nil {
 		return fmt.Errorf("waiting for %d bytes of staging space: %w", n, err)
 	}
