@@ -76,13 +76,23 @@ indexing PikPak root 'mychannel'
   staging        ./staging, capped at 40.0 GiB
   concurrency    2 download(s) x 4 thread(s), 2 upload(s)
 
-  total     26/606 files [=>              ] 617.5 MiB / 79.0 GiB  2.5 MiB/s  8h47m
-  ↓ …3214_4242_1000000000000000001.mp4   [=======>        ]  41.2 MiB / 96.0 MiB  1.8 MiB/s
-  ↑ …3214_4243_1000000000000000002.mp4   ⠹                          uploading 1.9 GiB
+  ↓ total    26/606 files [=>             ] 617.5 MiB / 79.0 GiB  2.5 MiB/s  8h47m
+  ↑ total    24/606 files [=>             ] 598.0 MiB / 79.0 GiB  2.4 MiB/s  8h58m
+  ↓ …3214_4242_1000000000000000001.mp4   [=======>       ]  41.2 MiB / 96.0 MiB  1.8 MiB/s
+  ↑ …3214_4243_1000000000000000002.mp4   ⠹                         uploading 1.9 GiB
 ```
 
-Redirected output gets the same information as plain periodic lines plus one
-line per archived file, with no cursor movement — a captured log stays readable.
+The two legs are counted separately because they run at different speeds and
+fail for different reasons. They normally track a file or two apart; a widening
+gap means the remote is falling behind and staging is filling up.
+
+Redirected output gets the same two figures as plain periodic lines, plus one
+line per archived file, with no cursor movement — a captured log stays readable:
+
+```
+  download 1,200/606 files, 45.0 GiB of 79.0 GiB, 76.8 MiB/s, ETA 7m33s
+  upload   1,190/606 files, 44.2 GiB of 79.0 GiB, 75.4 MiB/s, ETA 7m53s
+```
 
 `CHAT` accepts a numeric id as printed by `tdl chat ls`, a username with or
 without `@`, or a `t.me`/`tg://` link. A Bot API `-100…` id is converted

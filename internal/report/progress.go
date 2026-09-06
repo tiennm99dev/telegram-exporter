@@ -31,6 +31,8 @@ type Reporter struct {
 	total      int
 	totalBytes int64
 
+	legs legTotals
+
 	mu       sync.Mutex
 	started  time.Time
 	lastLine time.Time
@@ -64,6 +66,8 @@ func newReporter(w io.Writer, total int, totalBytes int64) *Reporter {
 // make write latency throttle the downloads themselves. A skipped frame costs
 // nothing; the next callback is milliseconds away and Finish always prints.
 func (r *Reporter) Stats(s pipeline.Stats) {
+	r.legs.setDownload(s.Done+s.Failed, s.BytesDone)
+
 	if !r.mu.TryLock() {
 		return
 	}
@@ -74,7 +78,9 @@ func (r *Reporter) Stats(s pipeline.Stats) {
 		return
 	}
 	r.lastLine = now
-	fmt.Fprintf(r.w, "%s\n", r.line(s, now))
+	for _, line := range r.lines(now) {
+		fmt.Fprintf(r.w, "%s\n", line)
+	}
 }
 
 // The per-file events are recorded as one line each rather than a bar. At one
@@ -93,6 +99,9 @@ func (r *Reporter) DownloadDone(it tgsource.Item, err error) {
 }
 
 func (r *Reporter) UploadDone(it tgsource.Item, err error) {
+	if err == nil {
+		r.legs.addUpload(it.Size())
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err != nil {
@@ -109,17 +118,28 @@ func (r *Reporter) Finish(s pipeline.Stats) {
 	writeSummary(r.w, s, time.Since(r.started))
 }
 
-func (r *Reporter) line(s pipeline.Stats, now time.Time) string {
+// lines renders one line per leg. Separately, because the two run at different
+// speeds and a single combined figure hides which of them is the bottleneck —
+// the question actually being asked when a run slows down.
+func (r *Reporter) lines(now time.Time) []string {
 	elapsed := now.Sub(r.started)
-	rate := float64(s.BytesDone) / max(elapsed.Seconds(), 1)
+	dlFiles, dlBytes, upFiles, upBytes := r.legs.snapshot()
+	return []string{
+		r.leg("download", dlFiles, dlBytes, elapsed),
+		r.leg("upload  ", upFiles, upBytes, elapsed),
+	}
+}
+
+func (r *Reporter) leg(label string, files int, bytes int64, elapsed time.Duration) string {
+	rate := float64(bytes) / max(elapsed.Seconds(), 1)
 	eta := "—"
-	if rate > 0 && r.totalBytes > s.BytesDone {
-		eta = time.Duration(float64(r.totalBytes-s.BytesDone) / rate * float64(time.Second)).
+	if rate > 0 && r.totalBytes > bytes {
+		eta = time.Duration(float64(r.totalBytes-bytes) / rate * float64(time.Second)).
 			Round(time.Second).String()
 	}
-	return fmt.Sprintf("  %s/%s files, %d failed, %s of %s, %s/s, ETA %s",
-		humanCount(s.Done), humanCount(r.total), s.Failed,
-		humanBytes(s.BytesDone), humanBytes(r.totalBytes), humanBytes(int64(rate)), eta)
+	return fmt.Sprintf("  %s %s/%s files, %s of %s, %s/s, ETA %s",
+		label, humanCount(files), humanCount(r.total),
+		humanBytes(bytes), humanBytes(r.totalBytes), humanBytes(int64(rate)), eta)
 }
 
 func humanBytes(n int64) string {

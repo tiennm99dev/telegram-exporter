@@ -17,7 +17,7 @@ import (
 // to 100+ characters and the bar has to fit beside them.
 const nameWidth = 34
 
-// Live renders a run as a set of progress bars: one overall, plus one for each
+// Live renders a run as a set of progress bars: one per leg, plus one for each
 // file currently moving.
 //
 // The aggregate line it replaces could say how much was done but never what was
@@ -25,20 +25,27 @@ const nameWidth = 34
 // a slow upload, how long the rest would take. On a run measured in hours those
 // are the only questions worth answering.
 //
+// Download and upload are counted separately because they run at different
+// speeds and fail for different reasons. A single combined figure hides the one
+// thing worth knowing when a run slows down: whether Telegram or the remote is
+// the bottleneck. The two normally track each other a file or two apart; a
+// widening gap is the remote falling behind, and staging filling up.
+//
 // Bars are for terminals only. A redirected run gets lineEvents instead, because
 // this writes ANSI cursor movement continuously and a captured log of it is
 // unreadable.
 type Live struct {
-	w     io.Writer
-	p     *mpb.Progress
-	total *mpb.Bar
+	w       io.Writer
+	p       *mpb.Progress
+	dlTotal *mpb.Bar
+	upTotal *mpb.Bar
 
 	mu   sync.Mutex
 	down map[int]*mpb.Bar
 	up   map[int]*mpb.Bar
-	// done is read by the overall bar's decorator from mpb's render goroutine,
-	// so it is guarded by the same lock as the maps.
-	done int
+	// The leg counters are read by the total bars' decorators from mpb's render
+	// goroutine, so they are guarded by the same lock as the maps.
+	legs legTotals
 
 	// seq gives each per-file bar a distinct, increasing priority so bars keep
 	// their position between frames. Sharing one priority lets mpb reorder them
@@ -71,13 +78,22 @@ func NewLive(w io.Writer, files int, bytes int64) *Live {
 		files: files,
 		start: time.Now(),
 	}
-	l.total = p.New(bytes,
+	l.dlTotal = l.leg(bytes, 0, "  ↓ total", func() int { return l.legs.downCount() })
+	l.upTotal = l.leg(bytes, 1, "  ↑ total", func() int { return l.legs.upCount() })
+	return l
+}
+
+// leg builds one of the two whole-run bars.
+func (l *Live) leg(bytes int64, priority int, label string, count func() int) *mpb.Bar {
+	return l.p.New(bytes,
 		mpb.BarStyle().Lbound("[").Filler("=").Tip(">").Padding(" ").Rbound("]"),
-		mpb.BarPriority(0),
+		mpb.BarPriority(priority),
 		mpb.BarNoPop(),
 		mpb.PrependDecorators(
-			decor.Name("  total  ", decor.WC{W: 9}),
-			decor.Any(func(decor.Statistics) string { return l.counts() }, decor.WC{W: 16}),
+			decor.Name(label+"  ", decor.WC{W: 11}),
+			decor.Any(func(decor.Statistics) string {
+				return fmt.Sprintf("%s/%s files", humanCount(count()), humanCount(l.files))
+			}, decor.WC{W: 16}),
 		),
 		mpb.AppendDecorators(
 			decor.CountersKibiByte("% .1f / % .1f", decor.WC{W: 20}),
@@ -87,11 +103,10 @@ func NewLive(w io.Writer, files int, bytes int64) *Live {
 			decor.OnComplete(decor.AverageETA(decor.ET_STYLE_GO, decor.WC{W: 13}), ""),
 		),
 	)
-	return l
 }
 
-// Bars are grouped by band: the total on top, then downloads, then uploads.
-// Within a band they are ordered by when they started.
+// Bars are grouped by band: the two totals on top, then per-file downloads,
+// then per-file uploads. Within a band they are ordered by when they started.
 const (
 	downloadBand = 1 << 20
 	uploadBand   = 1 << 21
@@ -105,20 +120,12 @@ func (l *Live) next(band int) int {
 	return band + l.seq
 }
 
-func (l *Live) counts() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return fmt.Sprintf("%s/%s files", humanCount(l.done), humanCount(l.files))
-}
-
-// Stats advances the overall bar.
+// Stats advances the download bar.
 func (l *Live) Stats(s pipeline.Stats) {
-	l.mu.Lock()
-	l.done = s.Done + s.Failed
-	l.mu.Unlock()
+	l.legs.setDownload(s.Done+s.Failed, s.BytesDone)
 	// The bar's own counters, speed and ETA all derive from this, so it is what
-	// makes the totals move rather than sitting at zero.
-	l.total.SetCurrent(s.BytesDone)
+	// makes the total move rather than sitting at zero.
+	l.dlTotal.SetCurrent(s.BytesDone)
 }
 
 func (l *Live) DownloadStart(it tgsource.Item) {
@@ -189,7 +196,7 @@ func (l *Live) UploadStart(it tgsource.Item) {
 	l.mu.Unlock()
 }
 
-func (l *Live) UploadDone(it tgsource.Item, _ error) {
+func (l *Live) UploadDone(it tgsource.Item, err error) {
 	l.mu.Lock()
 	bar := l.up[it.MessageID]
 	delete(l.up, it.MessageID)
@@ -197,6 +204,10 @@ func (l *Live) UploadDone(it tgsource.Item, _ error) {
 	if bar != nil {
 		bar.Abort(true)
 	}
+	if err != nil {
+		return // nothing reached the remote, so the upload total does not move
+	}
+	l.upTotal.SetCurrent(l.legs.addUpload(it.Size()))
 }
 
 // Finish drains the bars and prints the closing summary.
@@ -212,7 +223,8 @@ func (l *Live) Finish(s pipeline.Stats) {
 	clear(l.up)
 	l.mu.Unlock()
 
-	l.total.Abort(true)
+	l.dlTotal.Abort(true)
+	l.upTotal.Abort(true)
 	l.p.Wait()
 	writeSummary(l.w, s, time.Since(l.start))
 }
