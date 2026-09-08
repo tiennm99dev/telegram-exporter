@@ -46,6 +46,12 @@ type Options struct {
 	// Events, when set, receives the run's per-item lifecycle: which files are
 	// downloading, which are uploading, and how far along each one is.
 	Events Events
+
+	// Refresh, when set, re-reads a message for a live file reference just
+	// before its download starts. A run over a large chat outlasts the
+	// references its walk collected, so without this every fetch past that point
+	// fails with FILE_REFERENCE_EXPIRED; see elemIter.Next.
+	Refresh tgsource.Refresh
 }
 
 // Result is what a run achieved.
@@ -235,6 +241,7 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 			Limit:       o.Limit,
 			Takeout:     o.Takeout,
 			Events:      o.Events,
+			Refresh:     o.Refresh,
 			acquire:     budget.acquire,
 			release:     budget.release,
 			maxFailures: o.MaxFailures,

@@ -187,6 +187,28 @@ verifier, which matched on name and non-zero size — on the archive this was
 built for it found six objects that had been counted complete for months, one
 of them 221 MiB standing in for a 2 GiB video. Re-running repairs them.
 
+**File references.** Telegram hands out a short-lived token with every file
+location, and a run over a large chat outlives the ones its walk collected — the
+lifetime is undocumented, but an observed run stopped just under two hours in
+with `FILE_REFERENCE_EXPIRED` on every remaining file. So each message is re-read
+for a live token immediately before its own download, which costs one round trip
+per transfer and needs no guess at how long a token lasts. Retry passes go
+through the same path, so a token that dies during a single very large transfer
+is replaced rather than replayed.
+
+The re-read has to describe the same file — same name, same length — or it is not
+the file this run recorded, and archiving it under that name would store the
+wrong bytes. A message that fails that check, or that has been deleted, or that
+no longer holds a file at all, is skipped and reported: nothing can be archived
+for it, one of them must not strand the rest of the chat, and the closing
+`verify` still lists it as outstanding.
+
+A re-read that fails for any other reason is counted as a failed download, not a
+skip, because that is what it is — the connection that serves the re-read is the
+one that serves the file. So it is retried with the rest, it shows up in the
+progress report and the closing failure list, and enough of them in a row trip
+the same breaker below.
+
 **Failures.** A failed download is retried inside the run: up to three passes
 over whatever is still missing, spaced a minute and then two apart. The failure
 this exists for is the transient one — a connection that dies takes every

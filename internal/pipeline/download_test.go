@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -531,5 +532,262 @@ func TestProgressWithoutABreakerNeverTrips(t *testing.T) {
 	}
 	if p.brokeCircuit() {
 		t.Error("brokeCircuit() = true with no limit configured")
+	}
+}
+
+// The reference the walk minted is dead by the time a long run reaches the end
+// of its list, so the location the downloader is handed must be the one refresh
+// just produced. Without that substitution every fetch past the reference's
+// lifetime returns FILE_REFERENCE_EXPIRED and the breaker abandons the rest.
+func TestElemIterDownloadsTheRefreshedLocation(t *testing.T) {
+	staging := t.TempDir()
+	stale := testItem(t, 42, "clip.mp4", 10)
+
+	var asked []int
+	it := newElemIter(func(yield func(tgsource.Item, error) bool) { yield(stale, nil) },
+		staging, false)
+	it.refresh = func(_ context.Context, in tgsource.Item) (tgsource.Item, error) {
+		asked = append(asked, in.MessageID)
+		fresh := *in.Media
+		fresh.InputFileLoc = &tg.InputDocumentFileLocation{
+			ID:            in.Media.InputFileLoc.(*tg.InputDocumentFileLocation).ID,
+			FileReference: []byte("fresh"),
+		}
+		in.Media = &fresh
+		return in, nil
+	}
+	defer func() { _ = it.Close() }()
+
+	if !it.Next(t.Context()) {
+		t.Fatalf("Next produced nothing: %v", it.failure)
+	}
+	if len(asked) != 1 || asked[0] != 42 {
+		t.Fatalf("refresh calls = %v, want one for message 42", asked)
+	}
+
+	loc, ok := it.Value().File().Location().(*tg.InputDocumentFileLocation)
+	if !ok {
+		t.Fatalf("location is %T, want *tg.InputDocumentFileLocation", it.Value().File().Location())
+	}
+	if string(loc.FileReference) != "fresh" {
+		t.Errorf("downloader was handed file reference %q, want the refreshed one", loc.FileReference)
+	}
+}
+
+// A message that cannot be re-read — deleted, or now holding a different file —
+// must not strand every message behind it, which is what ending the walk would
+// mean. It is reported instead, so nothing vanishes silently.
+func TestElemIterSkipsItemsRefreshCannotFindAndKeepsGoing(t *testing.T) {
+	staging := t.TempDir()
+	gone := testItem(t, 7, "deleted.mp4", 10)
+	good := testItem(t, 8, "fine.mp4", 10)
+
+	seq := func(yield func(tgsource.Item, error) bool) {
+		if !yield(gone, nil) {
+			return
+		}
+		yield(good, nil)
+	}
+	it := newElemIter(seq, staging, false)
+	it.refresh = func(_ context.Context, in tgsource.Item) (tgsource.Item, error) {
+		if in.MessageID == 7 {
+			return tgsource.Item{}, fmt.Errorf("%w: message 7 was deleted", tgsource.ErrGone)
+		}
+		return in, nil
+	}
+	defer func() { _ = it.Close() }()
+
+	if !it.Next(t.Context()) {
+		t.Fatal("an unrefreshable item ended the walk; the item after it was never reached")
+	}
+	if got := it.current.item.MessageID; got != 8 {
+		t.Fatalf("Next yielded message %d, want the item after the missing one", got)
+	}
+	if it.failure != nil {
+		t.Errorf("a skipped item must not fail the run, got: %v", it.failure)
+	}
+	if len(it.skipped) != 1 {
+		t.Fatalf("skipped = %d, want 1", len(it.skipped))
+	}
+	if !strings.Contains(it.skipped[0].Error(), "message 7") {
+		t.Errorf("the skip should name the message, got: %v", it.skipped[0])
+	}
+}
+
+// A cancelled run ends the walk rather than skipping its way through the rest of
+// the list, one refused refresh at a time.
+func TestElemIterStopsWhenRefreshIsCancelled(t *testing.T) {
+	staging := t.TempDir()
+	seq := seqOf(testItems(3, 10))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	it := newElemIter(seq, staging, false)
+	it.refused = func(tgsource.Item, error) {
+		t.Error("cancellation was recorded as an item failure, which the breaker would count")
+	}
+	it.refresh = func(rctx context.Context, in tgsource.Item) (tgsource.Item, error) {
+		cancel()
+		return tgsource.Item{}, fmt.Errorf("re-read message %d: %w", in.MessageID, rctx.Err())
+	}
+	defer func() { _ = it.Close() }()
+
+	if it.Next(ctx) {
+		t.Fatal("Next produced an item after cancellation")
+	}
+	if !errors.Is(it.failure, context.Canceled) {
+		t.Errorf("failure = %v, want context.Canceled", it.failure)
+	}
+	if len(it.skipped) != 0 {
+		t.Errorf("cancellation was recorded as %d skipped item(s), not a failure", len(it.skipped))
+	}
+}
+
+// A refresh that failed for any reason other than the message being gone is the
+// same event as a transfer dying — Telegram is not serving this file — and has
+// to be counted as one. An item that never reaches a worker never reaches OnAdd
+// or OnDone, so on the skip path a source outage would move no counter, trip no
+// breaker and produce no Outcome for Run to retry, and would walk the whole todo
+// list one dead round trip at a time.
+func TestElemIterRecordsRefreshFailuresAsFailuresNotSkips(t *testing.T) {
+	staging := t.TempDir()
+	items := []tgsource.Item{
+		testItem(t, 1, "a.mp4", 10),
+		testItem(t, 2, "b.mp4", 20),
+	}
+
+	it := newElemIter(seqOf(items), staging, false)
+	defer func() { _ = it.Close() }()
+
+	prog := newProgress(func(*elem, error) error { return nil }, nil)
+	prog.maxStreak = 2
+	var tripped bool
+	prog.onTrip = func() { tripped = true; it.stopped.Store(true) }
+	it.refused = prog.refused
+	it.refresh = func(context.Context, tgsource.Item) (tgsource.Item, error) {
+		return tgsource.Item{}, errors.New("dial telegram: connection refused")
+	}
+
+	for it.Next(t.Context()) {
+		t.Fatal("Next handed over an item whose reference could not be refreshed")
+	}
+
+	if it.failure != nil {
+		t.Errorf("failure = %v, want none — a refused item ends the pass, not the program", it.failure)
+	}
+	if len(it.skipped) != 0 {
+		t.Errorf("skipped = %d, want 0 — a transient re-read failure is not a skip: %v",
+			len(it.skipped), it.skipped)
+	}
+
+	outcomes, stats := prog.results()
+	if len(outcomes) != 2 {
+		t.Fatalf("outcomes = %d, want 2 — Run builds its retry list from these", len(outcomes))
+	}
+	for _, oc := range outcomes {
+		if oc.Err == nil {
+			t.Errorf("message %d recorded without an error", oc.Item.MessageID)
+		}
+	}
+	if got := failedItems(outcomes); len(got) != 2 {
+		t.Errorf("failedItems = %d, want 2 — these have to reach the next pass", len(got))
+	}
+	if stats.Started != 2 || stats.Failed != 2 || stats.Done != 0 {
+		t.Errorf("Stats = %+v, want 2 started, 2 failed, 0 done", stats)
+	}
+	if stats.BytesTotal != 30 {
+		t.Errorf("BytesTotal = %d, want 30 — the report's target must include them", stats.BytesTotal)
+	}
+	if !tripped {
+		t.Error("two consecutive refused items did not trip the breaker")
+	}
+}
+
+// A message that is gone is the one refresh failure that is genuinely permanent,
+// so it stays on the skip path and must not spend the breaker's streak.
+func TestElemIterDoesNotCountAMissingMessageAsAFailure(t *testing.T) {
+	staging := t.TempDir()
+	it := newElemIter(seqOf([]tgsource.Item{testItem(t, 1, "a.mp4", 10)}), staging, false)
+	defer func() { _ = it.Close() }()
+
+	prog := newProgress(func(*elem, error) error { return nil }, nil)
+	prog.maxStreak = 1
+	prog.onTrip = func() { t.Error("a gone message tripped the source breaker") }
+	it.refused = func(tgsource.Item, error) { t.Error("a gone message was recorded as a failure") }
+	it.refresh = func(_ context.Context, in tgsource.Item) (tgsource.Item, error) {
+		return tgsource.Item{}, fmt.Errorf("%w: message %d was deleted", tgsource.ErrGone, in.MessageID)
+	}
+
+	for it.Next(t.Context()) {
+	}
+	if len(it.skipped) != 1 {
+		t.Fatalf("skipped = %d, want 1", len(it.skipped))
+	}
+	if outcomes, _ := prog.results(); len(outcomes) != 0 {
+		t.Errorf("outcomes = %d, want 0 — a gone message is not worth retrying", len(outcomes))
+	}
+}
+
+// The refresh has to come after the reservation, not before it. That acquire is
+// the run's brake: it blocks for as long as the destination is slow, and a
+// reference minted before it would spend that whole wait ageing — which on a
+// stalled remote is long enough to expire it again, reproducing the failure the
+// refresh exists to prevent.
+func TestElemIterRefreshesAfterReservingSpace(t *testing.T) {
+	staging := t.TempDir()
+	it := newElemIter(seqOf([]tgsource.Item{testItem(t, 1, "a.mp4", 4096)}), staging, false)
+	defer func() { _ = it.Close() }()
+
+	var acquired int64
+	it.acquire = func(_ context.Context, n int64) error { acquired += n; return nil }
+	it.release = func(n int64) { acquired -= n }
+
+	var heldAtRefresh int64
+	it.refresh = func(_ context.Context, in tgsource.Item) (tgsource.Item, error) {
+		heldAtRefresh = acquired
+		return in, nil
+	}
+
+	if !it.Next(t.Context()) {
+		t.Fatalf("Next produced nothing: %v", it.failure)
+	}
+	if heldAtRefresh != 4096 {
+		t.Errorf("staging held %d bytes when the reference was refreshed, want 4096 — "+
+			"the refresh ran before the acquire it is supposed to follow", heldAtRefresh)
+	}
+}
+
+// Whichever way a refresh fails, the bytes it reserved go back. Without that the
+// budget shrinks by that much for the rest of the run.
+func TestElemIterReturnsReservationWhenRefreshFails(t *testing.T) {
+	staging := t.TempDir()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"gone", fmt.Errorf("%w: deleted", tgsource.ErrGone)},
+		{"transient", errors.New("dial telegram: connection refused")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			it := newElemIter(seqOf([]tgsource.Item{testItem(t, 1, "a.mp4", 4096)}), staging, false)
+			defer func() { _ = it.Close() }()
+
+			var acquired, released int64
+			it.acquire = func(_ context.Context, n int64) error { acquired += n; return nil }
+			it.release = func(n int64) { released += n }
+			it.refresh = func(context.Context, tgsource.Item) (tgsource.Item, error) {
+				return tgsource.Item{}, tc.err
+			}
+
+			for it.Next(t.Context()) {
+			}
+			if acquired == 0 {
+				t.Fatal("nothing was reserved, so the test proves nothing")
+			}
+			if acquired != released {
+				t.Errorf("acquired %d bytes but released %d — the reservation leaked",
+					acquired, released)
+			}
+		})
 	}
 }

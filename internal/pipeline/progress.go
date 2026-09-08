@@ -122,6 +122,46 @@ func (p *progress) OnDone(e downloader.Elem, err error) {
 	p.events.Stats(stats)
 }
 
+// refused records an item that failed before any transfer could start.
+//
+// It exists so that "the message could not be re-read" counts as the same kind
+// of event as "the transfer died", because operationally it is: both mean
+// Telegram is not serving this file right now, and both are usually the same
+// outage. An item that never reaches a worker never reaches OnAdd or OnDone, so
+// without this it would move no counter, feed no streak, produce no Outcome for
+// Run to retry, and leave the live report on a still frame while the pass walked
+// the rest of the list.
+//
+// Everything OnDone does for a failure it does here, minus the file: the item is
+// counted as started and failed, its bytes join the total the report is working
+// towards, the streak advances so a dead source still trips the breaker, and the
+// Outcome is what makes Run try the item again on the next pass.
+func (p *progress) refused(it tgsource.Item, err error) {
+	p.mu.Lock()
+	p.stats.Started++
+	p.stats.BytesTotal += it.Size()
+	p.stats.Failed++
+	p.streak++
+	p.outcomes = append(p.outcomes, Outcome{Item: it, Err: err})
+	stats := p.stats
+	// Decided under the lock and acted on outside it, as in OnDone.
+	trip := p.maxStreak > 0 && p.streak >= p.maxStreak && !p.tripped
+	if trip {
+		p.tripped = true
+	}
+	p.mu.Unlock()
+
+	if trip && p.onTrip != nil {
+		p.onTrip()
+	}
+	// Reported as a start and an immediate end rather than as an end alone: a
+	// reporter tracking which files are in flight is entitled to see every item
+	// it is told about finish, and one it never saw start would be a stray.
+	p.events.DownloadStart(it)
+	p.events.DownloadDone(it, err)
+	p.events.Stats(stats)
+}
+
 // brokeCircuit reports whether the failure streak ended this pass.
 func (p *progress) brokeCircuit() bool {
 	p.mu.Lock()

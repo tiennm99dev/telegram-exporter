@@ -3,6 +3,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -76,6 +77,14 @@ type elemIter struct {
 	staging  string
 	takeout  bool
 
+	// refresh re-mints an item's file reference just before its download; see
+	// reminted. Unset leaves the walk's own reference in place.
+	refresh tgsource.Refresh
+	// refused records an item that failed before any transfer could start, so it
+	// counts as a failure rather than disappearing. Unset means such an item is
+	// only skipped.
+	refused func(tgsource.Item, error)
+
 	// acquire reserves staging space for the next item. Blocking here is what
 	// makes backpressure work: core's Download calls Next from its dispatch
 	// loop (downloader.go:38), so a blocked Next stops new downloads starting
@@ -122,7 +131,6 @@ func newElemIter(seq iter.Seq2[tgsource.Item, error], staging string, takeout bo
 }
 
 func (i *elemIter) Next(ctx context.Context) bool {
-	var item tgsource.Item
 	for {
 		if i.failure != nil || i.stopped.Load() {
 			return false
@@ -132,11 +140,7 @@ func (i *elemIter) Next(ctx context.Context) bool {
 			return false
 		}
 
-		var (
-			err error
-			ok  bool
-		)
-		item, err, ok = i.next()
+		item, err, ok := i.next()
 		if !ok {
 			return false
 		}
@@ -151,35 +155,110 @@ func (i *elemIter) Next(ctx context.Context) bool {
 		// is either a second caller or a gap there; in both cases one unwritable
 		// name must not strand the rest of the chat behind it.
 		if err := naming.Safe(item.Name); err != nil {
-			if len(i.skipped) < maxRecordedErrors {
-				i.skipped = append(i.skipped, fmt.Errorf("message %d: %w", item.MessageID, err))
+			i.skip(item, err)
+			continue
+		}
+
+		if i.acquire != nil {
+			if err := i.acquire(ctx, item.Size()); err != nil {
+				i.failure = err
+				return false
+			}
+		}
+
+		// The refreshed item replaces the original only on success. A failed
+		// refresh reports a zero Item, and handing that to the reservation or to
+		// the failure record would release nothing and blame message 0.
+		fresh, err := i.reminted(ctx, item)
+		if err == nil {
+			item = fresh
+		} else {
+			// Nothing was staged and nothing will be, so the reservation goes
+			// back before anything else; otherwise the cap ends the run
+			// over-committed by every item that failed here.
+			i.giveBack(item)
+			if ctx.Err() != nil {
+				i.failure = err
+				return false
+			}
+			// A message that is gone is skipped, for the same reason an
+			// unwritable name is: it is a permanent, per-message fact, and one
+			// of them must not strand every message behind it. Nothing is
+			// archived for it, so the run's closing verify still reports it as
+			// outstanding.
+			//
+			// Anything else is a failure and is recorded as one. Routing it
+			// there rather than onto the skip path is what keeps the breaker,
+			// the run's retry passes and the progress report working: a re-read
+			// fails because the connection did, which is exactly when every
+			// download is failing too, and a skip is invisible to all three — a
+			// source outage would otherwise walk the whole todo list one dead
+			// round trip at a time and still exit as merely incomplete.
+			if errors.Is(err, tgsource.ErrGone) {
+				i.skip(item, err)
+			} else if i.refused != nil {
+				i.refused(item, err)
 			}
 			continue
 		}
-		break
-	}
 
-	if i.acquire != nil {
-		if err := i.acquire(ctx, item.Size()); err != nil {
-			i.failure = err
+		f, err := os.OpenFile(partPath(i.staging, item), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			// The reservation is handed back here because this item will never
+			// reach a download, so no OnDone will ever release it for us.
+			i.giveBack(item)
+			i.failure = fmt.Errorf("open destination for message %d: %w", item.MessageID, err)
 			return false
 		}
-	}
+		i.opened = append(i.opened, f)
 
-	f, err := os.OpenFile(partPath(i.staging, item), os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		// The reservation is handed back here because this item will never
-		// reach a download, so no OnDone will ever release it for us.
-		if i.release != nil {
-			i.release(item.Size())
-		}
-		i.failure = fmt.Errorf("open destination for message %d: %w", item.MessageID, err)
-		return false
+		i.current = &elem{item: item, file: f, takeout: i.takeout}
+		return true
 	}
-	i.opened = append(i.opened, f)
+}
 
-	i.current = &elem{item: item, file: f, takeout: i.takeout}
-	return true
+// reminted replaces an item's file reference with one Telegram has just issued.
+//
+// The reference in Media.InputFileLoc was minted when the walk saw the message,
+// and Telegram expires those. The lifetime is undocumented and was observed to
+// outlast an hour but not two, which is less than a run over a large chat spends
+// downloading — so by the time the dispatch loop reaches an item near the end of
+// the list its reference is dead, every remaining fetch returns
+// FILE_REFERENCE_EXPIRED, and the breaker reads that as a dead source and
+// abandons everything still to come.
+//
+// It is called as late as Next can leave it, and in particular after the budget
+// acquire rather than before. core's downloader reads Elem.File().Location()
+// once per attempt, inside the worker (downloader.go:89), so the only wait left
+// between here and there is for a free worker slot, which one download bounds.
+// Re-minting before the acquire would reintroduce the very failure this exists
+// to prevent: that acquire is the run's brake and blocks for as long as the
+// destination is slow, which on a stalled remote is long enough to expire a
+// fresh token all over again.
+//
+// One round trip per transfer, and no guess at how long a reference lives.
+// Retries get it for free: Run feeds a failed item straight back through
+// Download, so a reference that died mid-transfer — a multi-gigabyte file can
+// outlive its own token — is re-minted on the next pass rather than replayed.
+func (i *elemIter) reminted(ctx context.Context, item tgsource.Item) (tgsource.Item, error) {
+	if i.refresh == nil {
+		return item, nil
+	}
+	return i.refresh(ctx, item)
+}
+
+// skip records an item no run will ever fetch, without ending this one.
+func (i *elemIter) skip(item tgsource.Item, err error) {
+	if len(i.skipped) < maxRecordedErrors {
+		i.skipped = append(i.skipped, fmt.Errorf("message %d: %w", item.MessageID, err))
+	}
+}
+
+// giveBack returns an item's staging reservation.
+func (i *elemIter) giveBack(item tgsource.Item) {
+	if i.release != nil {
+		i.release(item.Size())
+	}
 }
 
 func (i *elemIter) Value() downloader.Elem { return i.current }

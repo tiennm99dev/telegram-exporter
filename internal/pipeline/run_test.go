@@ -419,3 +419,35 @@ func TestRunDoesNotReportASourceThatRecovered(t *testing.T) {
 		t.Errorf("Failed() = %d, want 0", got)
 	}
 }
+
+// Every pass gets the refresher, retries included. Run feeds a failed item back
+// through Download as the same struct it failed with, so without this a
+// reference that expired mid-transfer would be replayed dead on every attempt.
+func TestRunRefreshesOnEveryPassIncludingRetries(t *testing.T) {
+	var passes int
+	refresh := func(_ context.Context, it tgsource.Item) (tgsource.Item, error) { return it, nil }
+
+	runFake(t, func(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
+		passes++
+		if o.Refresh == nil {
+			t.Errorf("pass %d was given no refresher", passes)
+		}
+		return stageItems(map[int]bool{2: true})(ctx, seq, o)
+	})
+
+	o, staging, _ := runOpts(t, 0)
+	o.Refresh = refresh
+
+	res, err := Run(t.Context(), seqOf(testItems(2, 10)), o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if passes != downloadAttempts {
+		t.Fatalf("passes = %d, want %d — the retry passes are where a stale reference would be replayed",
+			passes, downloadAttempts)
+	}
+	if got := len(res.Failed()); got != 1 {
+		t.Errorf("Failed() = %d, want 1", got)
+	}
+	assertEmpty(t, staging)
+}

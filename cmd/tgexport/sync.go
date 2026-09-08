@@ -176,6 +176,10 @@ func syncCmd(ctx context.Context, args []string) error {
 			Confirm: *confirm,
 			Takeout: *takeout,
 			Events:  rep,
+			// The walk above collected every item's file reference up front, and
+			// a run this size spends longer downloading than one of those stays
+			// valid, so each is re-read immediately before its own download.
+			Refresh: tgsource.Refresher(api, peer),
 			// Re-checked during the run, not only before it: an archive of this
 			// size runs for hours, and the destination can fill in the middle.
 			FreeBytes: func(ctx context.Context) (int64, bool) {

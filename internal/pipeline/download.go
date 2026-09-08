@@ -29,6 +29,11 @@ type DownloadOptions struct {
 	// concurrently.
 	Events Events
 
+	// Refresh, when set, re-mints an item's file reference just before its
+	// download starts. Unset means the reference the walk minted is used as-is,
+	// which only holds up for a run shorter than a reference's lifetime.
+	Refresh tgsource.Refresh
+
 	// acquire reserves staging space before a download starts, blocking until
 	// there is room. Unset means no bound. release hands a reservation back for
 	// an item that never reaches a download.
@@ -87,6 +92,7 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 	ctx = captureCauses(ctx)
 
 	it := newElemIter(seq, o.Staging, o.Takeout)
+	it.refresh = o.Refresh
 	it.acquire = o.acquire
 	it.release = o.release
 	if o.stop != nil {
@@ -113,6 +119,9 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 	prog.stats = o.seed
 	prog.maxStreak = o.maxFailures
 	prog.onTrip = func() { it.stopped.Store(true) }
+	// Wired after prog exists, so an item the iterator cannot even hand over is
+	// counted, reported and retried like any other failed transfer.
+	it.refused = prog.refused
 
 	err := downloader.New(downloader.Options{
 		Pool:     o.Pool,
