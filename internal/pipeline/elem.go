@@ -35,6 +35,13 @@ type elem struct {
 	item    tgsource.Item
 	file    *os.File
 	takeout bool
+
+	// cause is why the transfer failed, when the downloader logged a reason.
+	// It is the only route that reason has to reach finish, because core's
+	// Download logs it and returns nil; see captureCauses. Written by the log
+	// call on the download worker's goroutine and read by that worker's OnDone,
+	// so it needs no lock.
+	cause error
 }
 
 func (e *elem) File() downloader.File { return mediaFile{e.item} }

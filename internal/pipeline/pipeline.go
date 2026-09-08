@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"golang.org/x/sync/semaphore"
@@ -71,6 +72,37 @@ func (r Result) Failed() []Outcome {
 // pass identically, and a driver that retries walks the whole chat and downloads
 // gigabytes for nothing every time.
 var ErrDestinationFailing = errors.New("destination stopped accepting uploads")
+
+// ErrSourceFailing marks a run stopped because Telegram failed download after
+// download. It is the download leg's counterpart to ErrDestinationFailing and
+// means the same thing to a driver — another pass will fail the same way, so
+// retrying on "incomplete" only re-walks the chat for nothing — but it points at
+// the other half of the run, which is what an operator needs to know first.
+//
+// It survives the run's own retries: a pass that trips and then recovers reports
+// nothing, so this only appears when the last attempt was still failing.
+var ErrSourceFailing = errors.New("telegram stopped serving downloads")
+
+// downloadAttempts is how many passes a run makes over the items it failed to
+// fetch.
+//
+// Retrying inside the run is worth far more than leaving it to the next one: a
+// fresh sync re-walks every message and re-indexes the whole remote before it
+// can fetch a byte, while a retry here already has both. The failure this exists
+// for is the transient one — a dead connection or a source that stops serving
+// files for a few minutes takes down every transfer in flight, and every one of
+// them is fetchable again afterwards.
+const downloadAttempts = 3
+
+// retryDelay spaces the passes out, and is a var so tests need not sleep.
+//
+// Minutes rather than seconds: the client's own recovery gives up on a broken
+// connection only after the reconnect timeout (five minutes by default), so a
+// pass that starts seconds after the last one failed is a pass into the same
+// dead connection.
+var retryDelay = func(attempt int) time.Duration {
+	return time.Duration(attempt) * time.Minute
+}
 
 // maxRecordedErrors bounds what a run keeps from a failing remote. Past this,
 // the pattern is established and joining thousands of identical strings just
@@ -187,23 +219,97 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 		}()
 	}
 
-	dlOutcomes, stats, dlErr := download(ctx, seq, DownloadOptions{
-		Pool:    o.Pool,
-		Staging: o.Staging,
-		Threads: o.Threads,
-		Limit:   o.Limit,
-		Takeout: o.Takeout,
-		Events:  o.Events,
-		acquire: budget.acquire,
-		release: budget.release,
-		onReady: func(it tgsource.Item) { uploads <- it },
-		onFailed: func(it tgsource.Item) {
-			// Nothing was staged, so the reservation has to come back here
-			// instead of from an upload that will never happen.
-			budget.release(it.Size())
-		},
-		stop: stopDownloads,
-	})
+	var (
+		dlOutcomes []Outcome
+		stats      Stats
+		dlErrs     []error
+		at         = make(map[int]int) // message id -> its place in dlOutcomes
+	)
+	pending := seq
+	for attempt := 1; ; attempt++ {
+		sourceDown := false
+		passOutcomes, passStats, err := download(ctx, pending, DownloadOptions{
+			Pool:        o.Pool,
+			Staging:     o.Staging,
+			Threads:     o.Threads,
+			Limit:       o.Limit,
+			Takeout:     o.Takeout,
+			Events:      o.Events,
+			acquire:     budget.acquire,
+			release:     budget.release,
+			maxFailures: o.MaxFailures,
+			seed:        stats,
+			onReady:     func(it tgsource.Item) { uploads <- it },
+			onFailed: func(it tgsource.Item) {
+				// Nothing was staged, so the reservation has to come back here
+				// instead of from an upload that will never happen.
+				budget.release(it.Size())
+			},
+			stop:   stopDownloads,
+			onTrip: func() { sourceDown = true },
+		})
+		stats = passStats
+		if err != nil {
+			dlErrs = append(dlErrs, err)
+		}
+		// One outcome per item, whatever it took: a later attempt replaces the
+		// earlier verdict in place, so an item that failed once and then
+		// arrived is reported as archived rather than as both.
+		for _, oc := range passOutcomes {
+			if i, ok := at[oc.Item.MessageID]; ok {
+				dlOutcomes[i] = oc
+				continue
+			}
+			at[oc.Item.MessageID] = len(dlOutcomes)
+			dlOutcomes = append(dlOutcomes, oc)
+		}
+
+		// Read, and the shared stop flag cleared, under the upload leg's own
+		// lock. The flag is what the download breaker sets to end a pass, so a
+		// retry needs it clear — but clearing it after the upload breaker has
+		// tripped in this same window would restart downloads into a
+		// destination that has stopped accepting them, and that leg never sets
+		// the flag twice.
+		mu.Lock()
+		destDown := tripped
+		if !destDown {
+			stopDownloads.Store(false)
+		}
+		mu.Unlock()
+
+		// Another pass is worth making only for items that failed on their own.
+		// A pass that returned an error failed as a whole — the walk broke, a
+		// name could not be opened, the run was cancelled — and the items it
+		// never reached are lost to this run either way, so retrying the few
+		// that failed first would dress that up as a nearly complete run. A
+		// destination that has stopped accepting uploads rules it out too:
+		// fetching more would only fill staging with files it will refuse.
+		again := failedItems(passOutcomes)
+		if len(again) > 0 && attempt < downloadAttempts &&
+			err == nil && !destDown && ctx.Err() == nil {
+			// These items are being fetched again, so their first attempt comes
+			// back out of the totals: one item is one file to fetch, not one per
+			// attempt. Bytes already transferred stay counted — they were really
+			// spent, and throughput is the honest figure.
+			stats = rollback(stats, again)
+
+			wait := retryDelay(attempt)
+			o.Events.Retry(attempt+1, len(again), wait)
+			if serr := sleep(ctx, wait); serr == nil {
+				pending = itemsSeq(again)
+				continue
+			}
+			dlErrs = append(dlErrs, fmt.Errorf("cancelled before retrying %d download(s): %w",
+				len(again), ctx.Err()))
+		}
+
+		if sourceDown {
+			dlErrs = append(dlErrs, fmt.Errorf("%w: gave up after %d consecutive download failure(s)",
+				ErrSourceFailing, o.MaxFailures))
+		}
+		break
+	}
+	dlErr := errors.Join(dlErrs...)
 
 	// Safe only because Download joined its workers, which is guaranteed by
 	// elemIter.Err always being nil.
@@ -230,6 +336,39 @@ func Run(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Options) (R
 		upErr = fmt.Errorf("%d upload(s) failed: %w", total, joined)
 	}
 	return Result{Stats: stats, Outcomes: dlOutcomes}, errors.Join(dlErr, upErr)
+}
+
+// failedItems lists the items a pass did not manage to fetch.
+func failedItems(outcomes []Outcome) []tgsource.Item {
+	var out []tgsource.Item
+	for _, oc := range outcomes {
+		if oc.Err != nil {
+			out = append(out, oc.Item)
+		}
+	}
+	return out
+}
+
+// rollback takes a pass's failures back out of the running totals so the next
+// pass counts them once, not twice.
+func rollback(s Stats, again []tgsource.Item) Stats {
+	for _, it := range again {
+		s.Started--
+		s.Failed--
+		s.BytesTotal -= it.Size()
+	}
+	return s
+}
+
+// itemsSeq feeds a retry pass the items the last one failed.
+func itemsSeq(items []tgsource.Item) iter.Seq2[tgsource.Item, error] {
+	return func(yield func(tgsource.Item, error) bool) {
+		for _, it := range items {
+			if !yield(it, nil) {
+				return
+			}
+		}
+	}
 }
 
 // budget bounds how many bytes of downloaded-but-not-yet-uploaded data sit on

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
@@ -25,11 +26,18 @@ import (
 // pieces are wired together, and a regression in any of them is silent.
 
 // runFake substitutes the download step for the duration of a test.
+//
+// It also collapses the wait between retry passes. A run retries the items it
+// failed to fetch, and at the real cadence every test with a failure in it would
+// spend minutes asleep.
 func runFake(t *testing.T, f func(context.Context, iter.Seq2[tgsource.Item, error], DownloadOptions) ([]Outcome, Stats, error)) {
 	t.Helper()
-	prev := download
+	prev, prevDelay := download, retryDelay
 	download = f
-	t.Cleanup(func() { download = prev })
+	retryDelay = func(int) time.Duration { return time.Millisecond }
+	t.Cleanup(func() {
+		download, retryDelay = prev, prevDelay
+	})
 }
 
 // stageItems is a download step that writes each item's bytes into staging and
@@ -37,10 +45,10 @@ func runFake(t *testing.T, f func(context.Context, iter.Seq2[tgsource.Item, erro
 // Items named in fail never reach staging.
 func stageItems(fail map[int]bool) func(context.Context, iter.Seq2[tgsource.Item, error], DownloadOptions) ([]Outcome, Stats, error) {
 	return func(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
-		var (
-			outcomes []Outcome
-			stats    Stats
-		)
+		var outcomes []Outcome
+		// Seeded exactly as the real step does, so a retry pass continues the
+		// run's totals instead of restarting them.
+		stats := o.seed
 		for it, err := range seq {
 			if err != nil {
 				return outcomes, stats, err
@@ -213,10 +221,10 @@ func TestRunStopsDownloadingAfterConsecutiveUploadFailures(t *testing.T) {
 
 	var dispatched atomic.Int64
 	runFake(t, func(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
-		var (
-			outcomes []Outcome
-			stats    Stats
-		)
+		var outcomes []Outcome
+		// Seeded exactly as the real step does, so a retry pass continues the
+		// run's totals instead of restarting them.
+		stats := o.seed
 		for it := range seqValues(seq) {
 			if o.stop.Load() {
 				break
@@ -303,5 +311,111 @@ func assertEmpty(t *testing.T, dir string) {
 			names[i] = e.Name()
 		}
 		t.Errorf("staging is not empty: %v", names)
+	}
+}
+
+// A failure that clears on a later pass has to be reported as an archived file,
+// not as both a failure and a success. The whole point of retrying in-run is
+// that the outage which cost these items is usually over minutes later, and the
+// next sync would have to re-walk the chat and re-index the remote to find out.
+func TestRunRetriesFailedDownloadsWithinTheRun(t *testing.T) {
+	const size = 512
+	items := testItems(3, size)
+
+	var passes atomic.Int64
+	runFake(t, func(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
+		// The middle item fails on the first pass only, as a transient outage
+		// looks from here.
+		fail := map[int]bool{2: passes.Add(1) == 1}
+		return stageItems(fail)(ctx, seq, o)
+	})
+	o, staging, dstDir := runOpts(t, 0)
+
+	res, err := Run(t.Context(), seqOf(items), o)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if passes.Load() != 2 {
+		t.Errorf("passes = %d, want 2 — the failure was not retried", passes.Load())
+	}
+	if got := len(res.Failed()); got != 0 {
+		t.Errorf("Failed() = %d, want 0: %v", got, res.Failed())
+	}
+	if len(res.Outcomes) != len(items) {
+		t.Errorf("Outcomes = %d, want %d — a retried item must not be reported twice",
+			len(res.Outcomes), len(items))
+	}
+	// Counters follow the same rule: an item is one file to fetch however many
+	// attempts it took, or the closing summary claims more work than the chat
+	// contains.
+	if res.Stats.Done != 3 || res.Stats.Failed != 0 || res.Stats.Started != 3 {
+		t.Errorf("Stats = %+v, want 3 started, 3 done, 0 failed", res.Stats)
+	}
+	for _, it := range items {
+		if _, serr := os.Stat(filepath.Join(dstDir, it.Name)); serr != nil {
+			t.Errorf("%s should be on the destination: %v", it.Name, serr)
+		}
+	}
+	assertEmpty(t, staging)
+}
+
+// Retrying is bounded. A source that is down stays down for the run, and the
+// verdict has to be the distinct sentinel: a driver looping on "incomplete"
+// would otherwise re-walk the whole chat forever against a dead source.
+func TestRunGivesUpAndNamesTheSourceAfterEveryPassFails(t *testing.T) {
+	const size = 512
+	items := testItems(2, size)
+
+	var passes atomic.Int64
+	runFake(t, func(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
+		passes.Add(1)
+		outcomes, stats, err := stageItems(map[int]bool{1: true, 2: true})(ctx, seq, o)
+		// What Download reports once its own breaker has ended the pass.
+		if o.onTrip != nil {
+			o.onTrip()
+		}
+		return outcomes, stats, err
+	})
+	o, staging, _ := runOpts(t, 0)
+	o.MaxFailures = 2
+
+	res, err := Run(t.Context(), seqOf(items), o)
+	if !errors.Is(err, ErrSourceFailing) {
+		t.Fatalf("Run = %v, want ErrSourceFailing", err)
+	}
+	if got := passes.Load(); got != downloadAttempts {
+		t.Errorf("passes = %d, want %d", got, downloadAttempts)
+	}
+	if got := len(res.Failed()); got != len(items) {
+		t.Errorf("Failed() = %d, want %d", got, len(items))
+	}
+	assertEmpty(t, staging)
+}
+
+// A trip that the retry then clears must not reach the caller. Reported anyway,
+// it would send a driver to the "source is down, stop" exit code on a run that
+// finished everything.
+func TestRunDoesNotReportASourceThatRecovered(t *testing.T) {
+	const size = 512
+	items := testItems(2, size)
+
+	var passes atomic.Int64
+	runFake(t, func(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
+		first := passes.Add(1) == 1
+		outcomes, stats, err := stageItems(map[int]bool{1: first, 2: first})(ctx, seq, o)
+		if first && o.onTrip != nil {
+			o.onTrip()
+		}
+		return outcomes, stats, err
+	})
+	o, _, _ := runOpts(t, 0)
+	o.MaxFailures = 2
+
+	res, err := Run(t.Context(), seqOf(items), o)
+	if err != nil {
+		t.Fatalf("Run = %v, want nil after the retry succeeded", err)
+	}
+	if got := len(res.Failed()); got != 0 {
+		t.Errorf("Failed() = %d, want 0", got)
 	}
 }

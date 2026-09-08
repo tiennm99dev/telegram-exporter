@@ -35,6 +35,17 @@ type progress struct {
 	outcomes []Outcome
 	inFlight map[int]int64 // message id -> bytes written so far
 
+	// maxStreak is how many failures in a row end the pass; zero disables the
+	// breaker. streak counts them, and onTrip is called once when the limit is
+	// reached. The download leg needs this for the same reason the upload leg
+	// does: when the source stops serving files every item fails in
+	// milliseconds, and without a breaker a pass burns the entire remaining
+	// todo list on transfers that cannot succeed.
+	maxStreak int
+	streak    int
+	tripped   bool
+	onTrip    func()
+
 	finish func(*elem, error) error
 	events Events
 }
@@ -88,14 +99,34 @@ func (p *progress) OnDone(e downloader.Elem, err error) {
 	delete(p.inFlight, el.item.MessageID)
 	if err != nil {
 		p.stats.Failed++
+		p.streak++
 	} else {
 		p.stats.Done++
+		p.streak = 0
 	}
 	p.outcomes = append(p.outcomes, Outcome{Item: el.item, Err: err})
 	stats := p.stats
+	// Decided under the lock and acted on outside it: onTrip stops the
+	// iterator, and holding this mutex across it would put the callback's
+	// locking order inside this one's.
+	trip := p.maxStreak > 0 && p.streak >= p.maxStreak && !p.tripped
+	if trip {
+		p.tripped = true
+	}
 	p.mu.Unlock()
+
+	if trip && p.onTrip != nil {
+		p.onTrip()
+	}
 	p.events.DownloadDone(el.item, err)
 	p.events.Stats(stats)
+}
+
+// brokeCircuit reports whether the failure streak ended this pass.
+func (p *progress) brokeCircuit() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tripped
 }
 
 func (p *progress) results() ([]Outcome, Stats) {

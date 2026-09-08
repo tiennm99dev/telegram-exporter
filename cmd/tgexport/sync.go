@@ -213,11 +213,13 @@ func syncCmd(ctx context.Context, args []string) error {
 	final.Write(os.Stdout)
 
 	switch {
-	case errors.Is(runErr, pipeline.ErrDestinationFailing):
-		// Exit 3, not 1. The destination refused upload after upload, and it
-		// will refuse them next pass too — a driver retrying on "incomplete"
-		// would walk 18k messages and re-download gigabytes into a remote that
-		// cannot take a byte, indefinitely.
+	case errors.Is(runErr, pipeline.ErrDestinationFailing),
+		errors.Is(runErr, pipeline.ErrSourceFailing):
+		// Exit 3, not 1. One half of the run refused transfer after transfer,
+		// and it will refuse them next pass too — a driver retrying on
+		// "incomplete" would walk the whole chat and re-index the whole remote
+		// to achieve nothing, indefinitely. The run already retried the failures
+		// itself before giving up, so this is not a transient verdict.
 		return runErr
 	case final.Stalled():
 		return fmt.Errorf("%w: %d file(s) remain, none of which can be fetched",

@@ -210,6 +210,13 @@ func (l *Live) UploadDone(it tgsource.Item, err error) {
 	l.upTotal.SetCurrent(l.legs.addUpload(it.Size()))
 }
 
+// Retry prints above the bars rather than through them, so the pass that is
+// about to start is announced without shredding the display.
+func (l *Live) Retry(attempt, files int, wait time.Duration) {
+	fmt.Fprintf(l.p, "  retrying %s file(s) in %s — attempt %d\n",
+		humanCount(files), wait.Round(time.Second), attempt)
+}
+
 // Finish drains the bars and prints the closing summary.
 func (l *Live) Finish(s pipeline.Stats) {
 	l.mu.Lock()

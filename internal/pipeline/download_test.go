@@ -10,7 +10,9 @@ import (
 
 	"github.com/gotd/td/tg"
 	"github.com/iyear/tdl/core/downloader"
+	"github.com/iyear/tdl/core/logctx"
 	"github.com/iyear/tdl/core/tmedia"
+	"go.uber.org/zap"
 
 	"github.com/tiennm99dev/telegram-exporter/internal/naming"
 	"github.com/tiennm99dev/telegram-exporter/internal/tgsource"
@@ -427,5 +429,107 @@ func TestElemIterReturnsReservationWhenOpenFails(t *testing.T) {
 	}
 	if acquired != released {
 		t.Errorf("acquired %d bytes but released %d — the reservation leaked", acquired, released)
+	}
+}
+
+// The reason a transfer failed only exists in core's log call, so the capture is
+// tested through that exact call rather than by poking the field directly: it is
+// the shape of the log entry — a reflected element and a zap error — that this
+// depends on, and a change to it must fail here rather than silently go back to
+// reporting a byte count with no reason.
+func TestFinishReportsWhyTheTransferFailed(t *testing.T) {
+	staging := t.TempDir()
+	it := testItem(t, 5, "video.mp4", 1000)
+	e := openElem(t, staging, it)
+
+	want := errors.New("rpc error code 420: FLOOD_WAIT (60)")
+	ctx := captureCauses(t.Context())
+	logctx.From(ctx).Error("Download error",
+		zap.Any("element", downloader.Elem(e)), zap.Error(want))
+
+	// nil, exactly as core reports a transfer it has already logged and given up
+	// on, with nothing written to the file.
+	err := finish(staging, e, nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("finish = %v, want the logged transfer error", err)
+	}
+	if !strings.Contains(err.Error(), "expected 1000") {
+		t.Errorf("the byte count must survive alongside the reason, got: %v", err)
+	}
+}
+
+// Below error level nothing is captured, so an ordinary debug entry cannot
+// attach a bogus reason to an item that merely arrived short.
+func TestCaptureIgnoresNonErrorLogging(t *testing.T) {
+	staging := t.TempDir()
+	it := testItem(t, 6, "video.mp4", 1000)
+	e := openElem(t, staging, it)
+
+	ctx := captureCauses(t.Context())
+	logctx.From(ctx).Debug("Start download elem", zap.Any("elem", downloader.Elem(e)))
+
+	if e.cause != nil {
+		t.Fatalf("cause = %v, want nil for a debug entry", e.cause)
+	}
+	if err := finish(staging, e, nil); !strings.Contains(err.Error(), "short download") {
+		t.Errorf("finish = %v, want the plain size failure", err)
+	}
+}
+
+// The breaker exists because a source that has stopped serving files fails every
+// item in milliseconds: without it a pass spends the entire remaining todo list
+// proving the same point. A success in between is what tells a run of bad luck
+// apart from a source that is down, so it resets the streak.
+func TestProgressBreakerTripsOnConsecutiveFailuresOnly(t *testing.T) {
+	staging := t.TempDir()
+	trips := 0
+
+	p := newProgress(func(*elem, error) error { return nil }, nil)
+	p.maxStreak = 3
+	p.onTrip = func() { trips++ }
+
+	fail := func(id int) { p.OnDone(openElem(t, staging, testItem(t, id, "a.mp4", 10)), errors.New("boom")) }
+	ok := func(id int) { p.OnDone(openElem(t, staging, testItem(t, id, "a.mp4", 10)), nil) }
+
+	fail(1)
+	fail(2)
+	ok(3) // the streak is broken here, so the next two must not trip it
+	fail(4)
+	fail(5)
+	if trips != 0 {
+		t.Fatalf("tripped after a success reset the streak (trips = %d)", trips)
+	}
+	if p.brokeCircuit() {
+		t.Fatal("brokeCircuit() = true before the limit was reached")
+	}
+
+	fail(6)
+	if trips != 1 {
+		t.Fatalf("trips = %d, want 1 at three failures in a row", trips)
+	}
+	if !p.brokeCircuit() {
+		t.Error("brokeCircuit() = false after the breaker fired")
+	}
+
+	// Fires once: the callback stops the iterator, and repeating it for every
+	// item still in flight would be noise.
+	fail(7)
+	if trips != 1 {
+		t.Errorf("trips = %d, want the breaker to fire exactly once", trips)
+	}
+}
+
+// With no limit set there is no breaker at all, which is what a standalone
+// Download must keep doing: every item gets an attempt.
+func TestProgressWithoutABreakerNeverTrips(t *testing.T) {
+	staging := t.TempDir()
+	p := newProgress(func(*elem, error) error { return nil }, nil)
+	p.onTrip = func() { t.Error("onTrip called with no limit configured") }
+
+	for id := 1; id <= 20; id++ {
+		p.OnDone(openElem(t, staging, testItem(t, id, "a.mp4", 10)), errors.New("boom"))
+	}
+	if p.brokeCircuit() {
+		t.Error("brokeCircuit() = true with no limit configured")
 	}
 }

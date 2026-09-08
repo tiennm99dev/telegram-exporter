@@ -134,7 +134,7 @@ a chat.
 | 0 | complete |
 | 1 | ran, but files remain — run again |
 | 2 | usage error |
-| 3 | remote or Telegram failure, including a destination that stopped accepting uploads |
+| 3 | remote or Telegram failure, including either leg refusing transfer after transfer |
 | 4 | stalled: files remain, none of which can ever be fetched |
 | 130 / 143 | interrupted (SIGINT / SIGTERM) |
 
@@ -186,6 +186,20 @@ object is outstanding rather than "present". This is stricter than the shell
 verifier, which matched on name and non-zero size — on the archive this was
 built for it found six objects that had been counted complete for months, one
 of them 221 MiB standing in for a 2 GiB video. Re-running repairs them.
+
+**Failures.** A failed download is retried inside the run: up to three passes
+over whatever is still missing, spaced a minute and then two apart. The failure
+this exists for is the transient one — a connection that dies takes every
+transfer in flight with it, and all of them are fetchable again minutes later —
+and leaving them to the next run costs a full re-walk of the chat and a re-index
+of the remote before a byte can move. Each failure is reported with the reason
+Telegram gave for it, not just the byte count that arrived.
+
+Either leg gives up once five transfers in a row fail. A source or destination
+that is refusing everything will refuse the rest of the list too, in
+milliseconds, so the run stops and exits 3 instead of spending the whole
+outstanding list finding that out. A run that trips and then recovers on a retry
+reports nothing.
 
 ## Replacing the shell pipeline
 

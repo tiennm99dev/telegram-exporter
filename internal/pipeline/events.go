@@ -1,6 +1,10 @@
 package pipeline
 
-import "github.com/tiennm99dev/telegram-exporter/internal/tgsource"
+import (
+	"time"
+
+	"github.com/tiennm99dev/telegram-exporter/internal/tgsource"
+)
 
 // Events receives a run's per-item lifecycle.
 //
@@ -24,6 +28,12 @@ type Events interface {
 
 	UploadStart(it tgsource.Item)
 	UploadDone(it tgsource.Item, err error)
+
+	// Retry announces another pass over the items the last one failed, and how
+	// long the run waits first. It is the one event that is not per-item, and it
+	// exists because the wait is measured in minutes: a display that went quiet
+	// for that long with no explanation is indistinguishable from a hang.
+	Retry(attempt, files int, wait time.Duration)
 }
 
 // nopEvents is used when a caller wants no reporting, so nothing on the hot
@@ -36,3 +46,4 @@ func (nopEvents) DownloadBytes(tgsource.Item, int64) {}
 func (nopEvents) DownloadDone(tgsource.Item, error)  {}
 func (nopEvents) UploadStart(tgsource.Item)          {}
 func (nopEvents) UploadDone(tgsource.Item, error)    {}
+func (nopEvents) Retry(int, int, time.Duration)      {}

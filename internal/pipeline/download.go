@@ -38,6 +38,16 @@ type DownloadOptions struct {
 	// stop, when set, ends iteration cleanly from another goroutine — used to
 	// halt downloads once the destination has stopped accepting uploads.
 	stop *atomic.Bool
+	// maxFailures ends the pass after this many consecutive failures. Zero means
+	// no breaker. onTrip, when set, is called once if that happens — the caller
+	// decides what an abandoned pass means, because a retry that then succeeds
+	// must not report the source as down.
+	maxFailures int
+	onTrip      func()
+	// seed starts the run's counters from an earlier pass's totals, so a retry
+	// continues the numbers a reporter is already displaying rather than
+	// restarting them at zero.
+	seed Stats
 	// onReady hands a completed file to the upload leg; onFailed says nothing
 	// was staged, so whatever acquire reserved must be given back.
 	onReady  func(tgsource.Item)
@@ -55,7 +65,11 @@ type DownloadOptions struct {
 // guard, because it could not see inside tdl.
 //
 // A failed item does not abort the run: it is recorded in the returned outcomes
-// and the rest continue, matching what a partial `tdl dl` pass did.
+// and the rest continue, matching what a partial `tdl dl` pass did. Past
+// maxFailures failures in a row the pass gives up on the remaining items and
+// calls onTrip, because a source that is refusing every file will refuse the
+// rest of the list too, in milliseconds, and a pass with no brake spends the
+// whole todo list proving it.
 func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o DownloadOptions) ([]Outcome, Stats, error) {
 	if o.Threads <= 0 {
 		o.Threads = 4
@@ -66,6 +80,11 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 	if err := os.MkdirAll(o.Staging, 0o755); err != nil {
 		return nil, Stats{}, fmt.Errorf("create staging directory: %w", err)
 	}
+
+	// core's downloader logs why a transfer failed rather than returning it, so
+	// the logger it reaches for is pointed back into this package before any of
+	// its work starts. Without this the reason goes to a nop logger.
+	ctx = captureCauses(ctx)
 
 	it := newElemIter(seq, o.Staging, o.Takeout)
 	it.acquire = o.acquire
@@ -88,6 +107,12 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 		}
 		return ferr
 	}, o.Events)
+	// Set rather than passed: both are this package's own bookkeeping, and no
+	// worker exists yet, so the mutex the fields normally live under has
+	// nothing to protect them from here.
+	prog.stats = o.seed
+	prog.maxStreak = o.maxFailures
+	prog.onTrip = func() { it.stopped.Store(true) }
 
 	err := downloader.New(downloader.Options{
 		Pool:     o.Pool,
@@ -102,6 +127,12 @@ func Download(ctx context.Context, seq iter.Seq2[tgsource.Item, error], o Downlo
 	// join entirely.
 	if err == nil {
 		err = it.failure
+	}
+	// A tripped breaker is not an error here. It is reported to the caller, who
+	// knows whether another pass is coming; the items the pass never reached are
+	// simply absent from the outcomes.
+	if prog.brokeCircuit() && o.onTrip != nil {
+		o.onTrip()
 	}
 	// Skipped items are reported alongside whatever else happened rather than
 	// instead of it: the run did real work, and the caller still needs to know
@@ -131,6 +162,13 @@ func finish(staging string, e *elem, downloadErr error) error {
 
 	if downloadErr == nil {
 		if err := checkSize(part, e.item.Size()); err != nil {
+			// The size is the symptom. e.cause is the reason, when the
+			// downloader logged one, and it is put first: "got 0 bytes" alone
+			// says a two-gigabyte fetch failed without saying anything an
+			// operator can act on.
+			if e.cause != nil {
+				err = fmt.Errorf("%w: %w", e.cause, err)
+			}
 			downloadErr = err
 		}
 	}

@@ -111,6 +111,13 @@ func (r *Reporter) UploadDone(it tgsource.Item, err error) {
 	fmt.Fprintf(r.w, "  archived  %-10s %q\n", humanBytes(it.Size()), it.Name)
 }
 
+func (r *Reporter) Retry(attempt, files int, wait time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fmt.Fprintf(r.w, "  retrying %s file(s) in %s — attempt %d\n",
+		humanCount(files), wait.Round(time.Second), attempt)
+}
+
 // Finish writes the closing summary.
 func (r *Reporter) Finish(s pipeline.Stats) {
 	r.mu.Lock()
